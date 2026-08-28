@@ -82,6 +82,17 @@ def test_background_work_still_completes():
     assert p.prefetch_done is True
 
 
+def test_shutdown_reports_provider_lifecycle_failure():
+    class _FailedShutdownProvider(_SlowProvider):
+        def shutdown(self):
+            return False
+
+    manager = MemoryManager()
+    manager.add_provider(_FailedShutdownProvider(delay=0.0))
+
+    assert manager.shutdown_all() is False
+
+
 
 
 

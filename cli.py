@@ -1066,7 +1066,12 @@ def _prepare_deferred_agent_startup() -> None:
             exc_info=True,
         )
 
-def _arm_exit_watchdog(timeout_s: float | None = None, *, from_signal: bool = False) -> None:
+def _arm_exit_watchdog(
+    timeout_s: float | None = None,
+    *,
+    from_signal: bool = False,
+    exit_code: int = 0,
+) -> None:
     """Guarantee the process actually exits once shutdown has begun.
 
     Two hang classes have kept "dead" CLI processes alive for minutes:
@@ -1108,6 +1113,13 @@ def _arm_exit_watchdog(timeout_s: float | None = None, *, from_signal: bool = Fa
         # never starts.
         if from_signal and _cleanup_in_progress:
             return
+
+        # Unsafe one-shot cleanup must fail strictly and cannot risk blocking
+        # in logging or stream flushes before the hard exit. The default
+        # successful backstop retains its existing best-effort diagnostics.
+        if exit_code:
+            os._exit(exit_code)
+            return  # test doubles for os._exit may return
 
         # Still alive — cleanup or interpreter teardown is wedged.
         try:
@@ -1182,19 +1194,34 @@ def _arm_exit_watchdog_on_shutdown_signal() -> None:
         pass  # never let the backstop break signal handling
 
 
-def _run_cleanup(*, notify_session_finalize: bool = True):
+def _terminate_after_unsafe_memory_shutdown(message: str) -> None:
+    """Exit nonzero immediately when live workers make finalization unsafe."""
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get(
+        "HERMES_TEST_ISOLATION"
+    ):
+        raise RuntimeError(message)
+    os._exit(1)
+
+
+def _run_cleanup(
+    *, notify_session_finalize: bool = True, raise_on_failure: bool = False
+):
     """Run resource cleanup exactly once."""
     global _cleanup_done, _cleanup_in_progress
     if _cleanup_done:
         return
     _cleanup_done = True
     _cleanup_in_progress = True
+    cleanup_failure: RuntimeError | None = None
 
     try:
         # Bound total shutdown time: if cleanup (or the interpreter's
         # thread-join teardown after it) wedges, force-exit instead of
         # leaving a zombie CLI holding the terminal for minutes.
-        _arm_exit_watchdog()
+        if raise_on_failure:
+            _arm_exit_watchdog(exit_code=1)
+        else:
+            _arm_exit_watchdog()
 
         # Reset terminal input modes first, before the slower resource teardown
         # below (MCP / browser / memory shutdown can take seconds). On Ctrl+C the
@@ -1267,22 +1294,39 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
                 # partially-initialised agents where the attribute is missing.
                 _session_msgs = getattr(_active_agent_ref, '_session_messages', None)
                 if isinstance(_session_msgs, list):
-                    logger.info(
-                        "CLI cleanup calling memory shutdown for session %s with %d message(s)",
-                        getattr(_active_agent_ref, "session_id", None) or "<unknown>",
-                        len(_session_msgs),
+                    if not raise_on_failure:
+                        logger.info(
+                            "CLI cleanup calling memory shutdown for session %s with %d message(s)",
+                            getattr(_active_agent_ref, "session_id", None) or "<unknown>",
+                            len(_session_msgs),
+                        )
+                    shutdown_ok = _active_agent_ref.shutdown_memory_provider(
+                        _session_msgs
                     )
-                    _active_agent_ref.shutdown_memory_provider(_session_msgs)
                 else:
-                    logger.info(
-                        "CLI cleanup calling memory shutdown for session %s without session message list",
-                        getattr(_active_agent_ref, "session_id", None) or "<unknown>",
-                    )
-                    _active_agent_ref.shutdown_memory_provider()
+                    if not raise_on_failure:
+                        logger.info(
+                            "CLI cleanup calling memory shutdown for session %s without session message list",
+                            getattr(_active_agent_ref, "session_id", None) or "<unknown>",
+                        )
+                    shutdown_ok = _active_agent_ref.shutdown_memory_provider()
+                if shutdown_ok is False:
+                    message = "memory provider shutdown did not terminate all owned workers"
+                    if raise_on_failure:
+                        cleanup_failure = RuntimeError(message)
+                    else:
+                        logger.error("CLI cleanup %s", message)
         except Exception as e:
-            logger.warning("CLI cleanup memory shutdown failed: %s", e, exc_info=True)
+            if raise_on_failure:
+                cleanup_failure = RuntimeError(
+                    "memory provider shutdown raised during CLI cleanup"
+                )
+            else:
+                logger.warning("CLI cleanup memory shutdown failed: %s", e, exc_info=True)
     finally:
         _cleanup_in_progress = False
+    if cleanup_failure is not None:
+        _terminate_after_unsafe_memory_shutdown(str(cleanup_failure))
 
 
 def _should_emit_cleanup_session_finalize(session_id: str | None) -> bool:
@@ -1488,7 +1532,7 @@ def _finalize_single_query(cli) -> None:
         except Exception:
             logger.debug("one-shot session store flush failed", exc_info=True)
         _notify_single_query_session_finalize(cli)
-        _run_cleanup(notify_session_finalize=False)
+        _run_cleanup(notify_session_finalize=False, raise_on_failure=True)
     finally:
         cli._release_active_session()
 

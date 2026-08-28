@@ -4415,33 +4415,67 @@ class AIAgent:
             },
         )
 
-    def shutdown_memory_provider(self, messages: list = None) -> None:
-        """Shut down the memory provider and context engine at session end.
+    _memory_shutdown_condition_init_lock = threading.Lock()
+
+    def shutdown_memory_provider(self, messages: list = None) -> bool:
+        """Shut down memory resources and report provider lifecycle success.
 
         Idempotent: gateway cleanup and AIAgent.close() may share this
-        ownership boundary.
+        ownership boundary. Concurrent callers wait for the owner and receive
+        the same final result.
         """
-        if getattr(self, "_memory_provider_shutdown", False):
-            return
-        self._memory_provider_shutdown = True
-        if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
-            try:
-                self._memory_manager.shutdown_all()
-            except Exception:
-                pass
-        # Notify context engine of session end (flush DAG, close DBs, etc.)
-        if hasattr(self, "context_compressor") and self.context_compressor:
-            try:
-                self.context_compressor.on_session_end(
-                    self.session_id or "",
-                    messages or [],
+        condition = getattr(self, "_memory_shutdown_condition", None)
+        if condition is None:
+            with self._memory_shutdown_condition_init_lock:
+                condition = getattr(self, "_memory_shutdown_condition", None)
+                if condition is None:
+                    condition = threading.Condition()
+                    self._memory_shutdown_condition = condition
+
+        with condition:
+            state = getattr(self, "_memory_provider_shutdown_state", "not-started")
+            if state == "in-progress":
+                if getattr(self, "_memory_provider_shutdown_owner", None) == threading.get_ident():
+                    return False
+                condition.wait_for(
+                    lambda: self._memory_provider_shutdown_state == "finished"
                 )
-            except Exception:
-                pass
+                return self._memory_provider_shutdown_ok
+            if state == "finished":
+                return self._memory_provider_shutdown_ok
+            self._memory_provider_shutdown_state = "in-progress"
+            self._memory_provider_shutdown_owner = threading.get_ident()
+            self._memory_provider_shutdown = True
+
+        shutdown_ok = True
+        try:
+            if self._memory_manager:
+                try:
+                    if self._memory_manager.shutdown_all(
+                        messages or [], timeout=20.0
+                    ) is False:
+                        shutdown_ok = False
+                except Exception as e:
+                    shutdown_ok = False
+                    logger.warning(
+                        "Memory provider lifecycle shutdown failed: %s", e, exc_info=True
+                    )
+            # Notify context engine of session end (flush DAG, close DBs, etc.)
+            if hasattr(self, "context_compressor") and self.context_compressor:
+                try:
+                    self.context_compressor.on_session_end(
+                        self.session_id or "",
+                        messages or [],
+                    )
+                except Exception:
+                    pass
+            return shutdown_ok
+        finally:
+            with condition:
+                self._memory_provider_shutdown_ok = shutdown_ok
+                self._memory_provider_shutdown_state = "finished"
+                self._memory_provider_shutdown_owner = None
+                condition.notify_all()
 
     def commit_memory_session(self, messages: list = None) -> None:
         """Trigger end-of-session extraction without tearing providers down.

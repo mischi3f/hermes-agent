@@ -21,6 +21,8 @@ import types
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 @patch("hermes_cli.plugins.invoke_hook")
 def test_cleanup_forwards_session_messages(mock_invoke_hook):
@@ -70,6 +72,119 @@ def test_cleanup_provider_exception_is_swallowed(mock_invoke_hook):
         cli_mod._cleanup_done = False
 
     agent.shutdown_memory_provider.assert_called_once()
+
+
+@patch("hermes_cli.plugins.invoke_hook")
+def test_cleanup_can_propagate_bounded_provider_failure(mock_invoke_hook):
+    import cli as cli_mod
+
+    agent = MagicMock()
+    agent.session_id = "cli-session-id"
+    agent._session_messages = []
+    agent.shutdown_memory_provider.return_value = False
+
+    cli_mod._active_agent_ref = agent
+    cli_mod._cleanup_done = False
+    try:
+        with pytest.raises(RuntimeError, match="memory provider shutdown"):
+            cli_mod._run_cleanup(raise_on_failure=True)
+    finally:
+        cli_mod._active_agent_ref = None
+        cli_mod._cleanup_done = False
+
+    agent.shutdown_memory_provider.assert_called_once()
+
+
+def test_unsafe_cleanup_hard_exits_nonzero_before_blocking_logging_or_streams(monkeypatch):
+    import cli as cli_mod
+
+    exit_codes = []
+    exit_called = threading.Event()
+    release_blockers = threading.Event()
+    logging_entered = threading.Event()
+    stdout_entered = threading.Event()
+    stderr_entered = threading.Event()
+
+    def hard_exit(code):
+        exit_codes.append(code)
+        exit_called.set()
+
+    def blocking_logging_shutdown():
+        logging_entered.set()
+        release_blockers.wait(timeout=1.0)
+
+    class BlockingStream:
+        def __init__(self, entered):
+            self.entered = entered
+
+        def flush(self):
+            self.entered.set()
+            release_blockers.wait(timeout=1.0)
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
+    monkeypatch.setattr(cli_mod.os, "_exit", hard_exit)
+    monkeypatch.setattr(cli_mod.logging, "shutdown", blocking_logging_shutdown)
+    monkeypatch.setattr(cli_mod.sys, "stdout", BlockingStream(stdout_entered))
+    monkeypatch.setattr(cli_mod.sys, "stderr", BlockingStream(stderr_entered))
+
+    worker = threading.Thread(
+        target=cli_mod._terminate_after_unsafe_memory_shutdown,
+        args=("memory provider shutdown did not terminate all owned workers",),
+    )
+    worker.start()
+    exited_before_blockers = exit_called.wait(timeout=0.1)
+    release_blockers.set()
+    worker.join(timeout=1.0)
+
+    assert exited_before_blockers is True
+    assert exit_codes == [1]
+    assert not logging_entered.is_set()
+    assert not stdout_entered.is_set()
+    assert not stderr_entered.is_set()
+
+
+def test_strict_cleanup_hard_exits_before_blocking_error_log(monkeypatch):
+    import cli as cli_mod
+
+    exit_called = threading.Event()
+    logging_entered = threading.Event()
+    release_logging = threading.Event()
+    exit_codes = []
+    agent = MagicMock()
+    agent.session_id = "synthetic-session"
+    agent._session_messages = []
+    agent._memory_manager = None
+    agent.shutdown_memory_provider.return_value = False
+
+    def hard_exit(code):
+        exit_codes.append(code)
+        exit_called.set()
+
+    def blocking_error(*_args, **_kwargs):
+        logging_entered.set()
+        release_logging.wait(timeout=0.3)
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("HERMES_TEST_ISOLATION", raising=False)
+    monkeypatch.setattr(cli_mod, "_arm_exit_watchdog", lambda *a, **k: None)
+    monkeypatch.setattr(cli_mod.os, "_exit", hard_exit)
+    monkeypatch.setattr(cli_mod.logger, "error", blocking_error)
+    monkeypatch.setattr(cli_mod, "_active_agent_ref", agent)
+    monkeypatch.setattr(cli_mod, "_cleanup_done", False)
+
+    worker = threading.Thread(
+        target=cli_mod._run_cleanup,
+        kwargs={"notify_session_finalize": False, "raise_on_failure": True},
+    )
+    worker.start()
+    logging_was_entered = logging_entered.wait(timeout=0.5)
+    release_logging.set()
+    worker.join(timeout=2.0)
+
+    assert exit_codes == [1]
+    assert logging_was_entered is False
+    assert not logging_entered.is_set()
 
 
 

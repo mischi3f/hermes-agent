@@ -7,6 +7,7 @@ import queue
 import re
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -203,8 +204,52 @@ class HonchoSessionManager:
         self._async_queue: queue.Queue | None = None
         self._async_thread: threading.Thread | None = None
         self._async_thread_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._shutdown_event = threading.Event()
+        self._owned_workers_lock = threading.Lock()
+        self._owned_workers: set[threading.Thread] = set()
+        self._flush_lock = threading.RLock()
         if write_frequency == "async":
             self._async_queue = queue.Queue()
+
+    def _start_owned_worker(
+        self,
+        target: Callable[[], None],
+        *,
+        name: str,
+        permit_shutdown: bool = False,
+    ) -> threading.Thread | None:
+        """Start and retain a manager-owned worker unless shutdown has begun."""
+        with self._owned_workers_lock:
+            if self._shutdown_event.is_set() and not permit_shutdown:
+                logger.warning("Honcho manager is shutting down; rejecting %s work", name)
+                return None
+
+            def _run() -> None:
+                try:
+                    target()
+                finally:
+                    with self._owned_workers_lock:
+                        self._owned_workers.discard(threading.current_thread())
+
+            thread = spawn_context_thread(_run, name=name, daemon=False)
+            self._owned_workers.add(thread)
+            thread.start()
+            return thread
+
+    def owned_worker_threads(self) -> list[threading.Thread]:
+        """Return the live workers whose lifecycle is owned by this manager."""
+        with self._owned_workers_lock:
+            workers = [thread for thread in self._owned_workers if thread.is_alive()]
+        async_thread = self._async_thread
+        if (
+            async_thread is not None
+            and async_thread.is_alive()
+            and async_thread not in workers
+        ):
+            workers.append(async_thread)
+        return workers
 
     @property
     def honcho(self) -> Honcho:
@@ -659,6 +704,11 @@ class HonchoSessionManager:
 
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
+        with self._flush_lock:
+            return self._flush_session_locked(session)
+
+    def _flush_session_locked(self, session: HonchoSession) -> bool:
+        """Write one session while serializing async and shutdown flushes."""
         if not session.messages:
             return True
 
@@ -746,21 +796,25 @@ class HonchoSessionManager:
           "session" — defer until flush_session() is called explicitly
           N (int)   — flush every N turns
         """
-        self._turn_counter += 1
-        wf = self._write_frequency
+        with self._lifecycle_lock:
+            if self._shutdown_event.is_set():
+                logger.warning("Honcho manager is shutting down; rejecting late save")
+                return
+            self._turn_counter += 1
+            wf = self._write_frequency
 
-        if wf == "async":
-            if self._async_queue is not None:
-                self._ensure_async_writer()
-                self._async_queue.put(session)
-        elif wf == "turn":
-            self._flush_session(session)
-        elif wf == "session":
-            # Accumulate; caller must call flush_all() at session end
-            pass
-        elif isinstance(wf, int) and wf > 0:
-            if self._turn_counter % wf == 0:
+            if wf == "async":
+                if self._async_queue is not None:
+                    self._ensure_async_writer()
+                    self._async_queue.put(session)
+            elif wf == "turn":
                 self._flush_session(session)
+            elif wf == "session":
+                # Accumulate; caller must call flush_all() at session end
+                pass
+            elif isinstance(wf, int) and wf > 0:
+                if self._turn_counter % wf == 0:
+                    self._flush_session(session)
 
     def flush_all(self) -> None:
         """Flush all pending unsynced messages for all cached sessions.
@@ -777,46 +831,116 @@ class HonchoSessionManager:
                 logger.error("Honcho flush_all error for %s: %s", session.key, e)
 
         # Drain async queue synchronously if it exists
+        queued_sessions = []
         if self._async_queue is not None:
-            while not self._async_queue.empty():
-                try:
-                    item = self._async_queue.get_nowait()
-                    if item is not _ASYNC_SHUTDOWN:
-                        self._flush_session(item)
-                except queue.Empty:
-                    break
+            with self._lifecycle_lock:
+                while not self._async_queue.empty():
+                    try:
+                        item = self._async_queue.get_nowait()
+                        if item is _ASYNC_SHUTDOWN:
+                            self._async_queue.put_nowait(_ASYNC_SHUTDOWN)
+                            break
+                        queued_sessions.append(item)
+                    except queue.Empty:
+                        break
+        for item in queued_sessions:
+            self._flush_session(item)
+
+    def flush_all_bounded(
+        self,
+        timeout: float,
+        *,
+        worker_name: str = "honcho-session-end-flush",
+        permit_shutdown: bool = False,
+    ) -> bool:
+        """Run ``flush_all`` in an owned worker bounded by one deadline."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        worker = self._start_owned_worker(
+            self.flush_all,
+            name=worker_name,
+            permit_shutdown=permit_shutdown,
+        )
+        if worker is None:
+            return False
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not worker.is_alive()
 
     def _ensure_async_writer(self) -> None:
         """Start the async writer on first enqueue (idempotent, thread-safe)."""
-        if self._async_thread is not None and self._async_thread.is_alive():
-            return
-        with self._async_thread_lock:
+        with self._lifecycle_lock, self._async_thread_lock:
+            if self._shutdown_event.is_set():
+                return
             if self._async_thread is None or not self._async_thread.is_alive():
-                self._async_thread = spawn_context_thread(
+                self._async_thread = self._start_owned_worker(
                     self._async_writer_loop,
                     name="honcho-async-writer",
                 )
-                self._async_thread.start()
 
-    def stop_async_writer(self) -> None:
+    def stop_async_writer(self, timeout: float = 10.0) -> bool:
         """Stop the async writer thread WITHOUT flushing pending messages.
 
         Used on shutdown when persistence is disabled (saveMessages: false):
         the thread must still be joined so process exit is clean, but nothing
         may be written.
         """
-        if self._async_queue is not None:
-            if self._async_thread is not None and self._async_thread.is_alive():
-                self._async_queue.put(_ASYNC_SHUTDOWN)
-                self._async_thread.join(timeout=10)
+        return self.shutdown(timeout=timeout, flush=False)
 
-    def shutdown(self) -> None:
-        """Gracefully shut down the async writer thread."""
-        if self._async_queue is not None:
-            self.flush_all()
-            if self._async_thread is not None and self._async_thread.is_alive():
-                self._async_queue.put(_ASYNC_SHUTDOWN)
-                self._async_thread.join(timeout=10)
+    def shutdown(self, timeout: float = 10.0, *, flush: bool = True) -> bool:
+        """Stop admission, drain work to one deadline, and verify termination."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        if not self._shutdown_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            if not self._lifecycle_lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            ):
+                return False
+            try:
+                self._shutdown_event.set()
+            finally:
+                self._lifecycle_lock.release()
+
+            flush_ok = True
+            if flush:
+                flush_ok = self.flush_all_bounded(
+                    max(0.0, deadline - time.monotonic()),
+                    worker_name="honcho-shutdown-flush",
+                    permit_shutdown=True,
+                )
+                if not flush_ok:
+                    logger.error("Honcho shutdown deadline expired during flush")
+
+            async_thread = self._async_thread
+            if (
+                self._async_queue is not None
+                and async_thread is not None
+                and async_thread.is_alive()
+            ):
+                # Admission was closed under _lifecycle_lock above, so every
+                # previously admitted save has already queued before this
+                # non-blocking sentinel and no new save can follow it.
+                self._async_queue.put_nowait(_ASYNC_SHUTDOWN)
+                async_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+            with self._owned_workers_lock:
+                workers = list(self._owned_workers)
+            for worker in workers:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+            alive = self.owned_worker_threads()
+            if alive:
+                names = sorted({thread.name for thread in alive})
+                logger.error(
+                    "Honcho shutdown deadline expired with %d worker(s) still alive: %s",
+                    len(alive),
+                    ", ".join(names),
+                )
+                return False
+            return flush_ok
+        finally:
+            self._shutdown_lock.release()
 
     def delete(self, key: str) -> bool:
         """Delete a session from local cache."""
@@ -964,8 +1088,7 @@ class HonchoSessionManager:
             if result:
                 self.set_context_result(session_key, result)
 
-        t = spawn_context_thread(_run, name="honcho-context-prefetch")
-        t.start()
+        self._start_owned_worker(_run, name="honcho-context-prefetch")
 
     def set_context_result(self, session_key: str, result: dict[str, str]) -> None:
         """Store a prefetched context result in a thread-safe way."""

@@ -1189,7 +1189,10 @@ class TestDialecticLifecycleSmoke:
 
         # ---- session end: flush messages ----
         provider.on_session_end([])
-        mgr.flush_all.assert_called()
+        mgr.flush_all_bounded.assert_called_once_with(
+            provider._SESSION_END_FLUSH_TIMEOUT,
+            worker_name="honcho-session-end-flush",
+        )
 
 
 class TestReasoningHeuristic:

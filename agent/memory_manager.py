@@ -30,6 +30,7 @@ import logging
 import re
 import inspect
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
@@ -1191,24 +1192,48 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    def shutdown_all(self) -> None:
-        """Shut down all providers (reverse order for clean teardown).
+    def shutdown_all(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        *,
+        timeout: float = 20.0,
+    ) -> bool:
+        """Shut down all providers and report bounded lifecycle success.
 
         Drains the background sync/prefetch executor first (bounded by
         ``_SYNC_DRAIN_TIMEOUT_S``) so a turn's final sync has a chance to
-        land before providers are torn down. The worker threads are
-        daemon, so anything still wedged past the drain window dies with
-        the interpreter rather than blocking exit.
+        land before providers are torn down. A timed-out executor or provider
+        that explicitly reports live owned workers makes the result false.
         """
-        self._drain_sync_executor()
+        deadline = time.monotonic() + max(0.0, timeout)
+        self._drain_sync_executor(
+            timeout=min(
+                _SYNC_DRAIN_TIMEOUT_S,
+                max(0.0, deadline - time.monotonic()),
+            )
+        )
+        shutdown_ok = self.shutdown_drain_state.get("status") != "timed_out"
         for provider in reversed(self._providers):
             try:
-                provider.shutdown()
+                lifecycle = getattr(provider, "shutdown_session", None)
+                if callable(lifecycle):
+                    result = lifecycle(messages or [], deadline=deadline)
+                else:
+                    provider.on_session_end(messages or [])
+                    result = provider.shutdown()
+                if result is False:
+                    shutdown_ok = False
+                    logger.error(
+                        "Memory provider '%s' did not terminate all owned workers",
+                        provider.name,
+                    )
             except Exception as e:
+                shutdown_ok = False
                 logger.warning(
                     "Memory provider '%s' shutdown failed: %s",
                     provider.name, e,
                 )
+        return shutdown_ok
 
     @property
     def shutdown_drain_state(self) -> Dict[str, Any]:
@@ -1216,7 +1241,7 @@ class MemoryManager:
         with self._sync_executor_lock:
             return dict(self._shutdown_drain_state)
 
-    def _drain_sync_executor(self) -> None:
+    def _drain_sync_executor(self, timeout: float = _SYNC_DRAIN_TIMEOUT_S) -> None:
         """Give queued FIFO work a bounded chance, then abandon explicitly."""
         with self._sync_executor_lock:
             self._shutting_down = True
@@ -1236,7 +1261,7 @@ class MemoryManager:
         # Waiting on the tracked futures lets the real single-worker executor
         # run every queued write/boundary task in order up to the deadline.
         executor.shutdown(wait=False, cancel_futures=False)
-        _, pending = wait(tuple(tracked), timeout=_SYNC_DRAIN_TIMEOUT_S)
+        _, pending = wait(tuple(tracked), timeout=max(0.0, timeout))
         if not pending:
             with self._sync_executor_lock:
                 self._shutdown_drain_state.update(status="drained", active_tasks=0)
@@ -1265,7 +1290,7 @@ class MemoryManager:
         logger.warning(
             "Memory shutdown drain timed out after %.2fs; abandoning %d queued "
             "memory write(s) and %d queued prefetch(es); %d active task(s) remain detached",
-            _SYNC_DRAIN_TIMEOUT_S,
+            timeout,
             abandoned_writes,
             abandoned_prefetches,
             active_tasks,

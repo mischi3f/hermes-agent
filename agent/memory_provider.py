@@ -237,6 +237,21 @@ class MemoryProvider(ABC):
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""
 
+    def shutdown_session(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float,
+    ) -> Any:
+        """Run the final session hook and provider shutdown under one budget.
+
+        Providers with owned background work should override this method and
+        spend only the time remaining before ``deadline`` across both phases.
+        The default preserves legacy providers' synchronous lifecycle.
+        """
+        self.on_session_end(messages)
+        return self.shutdown()
+
     # -- Optional hooks (override to opt in) ---------------------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:

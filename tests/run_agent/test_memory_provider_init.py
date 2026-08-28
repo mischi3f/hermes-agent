@@ -1,6 +1,7 @@
 """Regression tests for memory provider selection during AIAgent init."""
 
 from types import SimpleNamespace
+import threading
 from unittest.mock import patch
 
 
@@ -39,8 +40,121 @@ def test_shutdown_memory_provider_is_idempotent():
     agent.shutdown_memory_provider([{"role": "user", "content": "one"}])
     agent.shutdown_memory_provider([{"role": "user", "content": "two"}])
 
-    manager.on_session_end.assert_called_once()
+    manager.on_session_end.assert_not_called()
+    manager.shutdown_all.assert_called_once_with(
+        [{"role": "user", "content": "one"}], timeout=20.0
+    )
+
+
+def test_shutdown_memory_provider_propagates_lifecycle_failure():
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    manager = MagicMock()
+    manager.shutdown_all.return_value = False
+    agent = object.__new__(AIAgent)
+    agent._memory_manager = manager
+    agent.context_compressor = None
+    agent.session_id = "session-1"
+
+    assert agent.shutdown_memory_provider([]) is False
+
+
+def test_shutdown_memory_provider_uses_one_combined_lifecycle_budget():
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    manager = MagicMock()
+    manager.shutdown_all.return_value = True
+    agent = object.__new__(AIAgent)
+    agent._memory_manager = manager
+    agent.context_compressor = None
+    agent.session_id = "session-1"
+    messages = [{"role": "user", "content": "synthetic prompt"}]
+
+    assert agent.shutdown_memory_provider(messages) is True
+
+    manager.on_session_end.assert_not_called()
+    manager.shutdown_all.assert_called_once_with(messages, timeout=20.0)
+
+
+def test_concurrent_shutdown_callers_wait_for_final_failure_result():
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    entered = threading.Event()
+    release = threading.Event()
+    manager = MagicMock()
+
+    def blocked_shutdown(_messages, *, timeout):
+        assert timeout == 20.0
+        entered.set()
+        assert release.wait(timeout=1.0)
+        return False
+
+    manager.shutdown_all.side_effect = blocked_shutdown
+    agent = object.__new__(AIAgent)
+    agent._memory_manager = manager
+    agent.context_compressor = None
+    agent.session_id = "session-1"
+    results = {}
+    second_done = threading.Event()
+
+    first = threading.Thread(
+        target=lambda: results.setdefault("first", agent.shutdown_memory_provider([]))
+    )
+
+    def second_shutdown():
+        results["second"] = agent.shutdown_memory_provider([])
+        second_done.set()
+
+    second = threading.Thread(target=second_shutdown)
+    first.start()
+    assert entered.wait(timeout=1.0)
+    second.start()
+    completed_early = second_done.wait(timeout=0.1)
+    release.set()
+    first.join(timeout=1.0)
+    second.join(timeout=1.0)
+
+    assert completed_early is False
+    assert results == {"first": False, "second": False}
     manager.shutdown_all.assert_called_once()
+
+
+def test_same_thread_recursive_shutdown_fails_closed_without_waiting():
+    from unittest.mock import MagicMock
+
+    from run_agent import AIAgent
+
+    manager = MagicMock()
+    agent = object.__new__(AIAgent)
+    agent._memory_manager = manager
+    agent.context_compressor = None
+    agent.session_id = "session-1"
+    results = {}
+    outer_done = threading.Event()
+
+    def recursive_shutdown(_messages, *, timeout):
+        assert timeout == 20.0
+        results["inner"] = agent.shutdown_memory_provider([])
+        return results["inner"]
+
+    manager.shutdown_all.side_effect = recursive_shutdown
+
+    def outer_shutdown():
+        results["outer"] = agent.shutdown_memory_provider([])
+        outer_done.set()
+
+    worker = threading.Thread(target=outer_shutdown, daemon=True)
+    worker.start()
+    completed_without_self_deadlock = outer_done.wait(timeout=0.2)
+
+    assert completed_without_self_deadlock is True
+    assert results == {"inner": False, "outer": False}
 
 
 def test_blank_memory_provider_does_not_auto_enable_honcho():

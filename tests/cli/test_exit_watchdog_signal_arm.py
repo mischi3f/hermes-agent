@@ -52,6 +52,29 @@ class TestSignalArmLogic:
         with patch.object(cli, "_arm_exit_watchdog", side_effect=RuntimeError("boom")):
             cli._arm_exit_watchdog_on_shutdown_signal()  # must not raise
 
+    def test_failure_watchdog_uses_nonzero_exit_code(self, monkeypatch):
+        captured = {}
+        exit_codes = []
+
+        class CapturingThread:
+            def __init__(self, *, target, **_kwargs):
+                captured["target"] = target
+
+            def start(self):
+                pass
+
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        monkeypatch.setattr(cli.threading, "Thread", CapturingThread)
+        monkeypatch.setattr(cli.time, "sleep", lambda _timeout: None)
+        monkeypatch.setattr(cli.os, "_exit", lambda code: exit_codes.append(code))
+        monkeypatch.setattr(cli.logger, "warning", lambda *_a, **_k: None)
+        monkeypatch.setattr(cli.logging, "shutdown", lambda: None)
+
+        cli._arm_exit_watchdog(timeout_s=0.01, exit_code=1)
+        captured["target"]()
+
+        assert exit_codes == [1]
+
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

@@ -71,7 +71,10 @@ class TestOnSessionEnd:
     def test_enabled_flushes(self):
         p = _provider(save_messages=True)
         p.on_session_end([])
-        p._manager.flush_all.assert_called_once()
+        p._manager.flush_all_bounded.assert_called_once_with(
+            p._SESSION_END_FLUSH_TIMEOUT,
+            worker_name="honcho-session-end-flush",
+        )
 
 
 class TestShutdown:
@@ -93,8 +96,9 @@ class TestShutdown:
         p = self._provider_for_shutdown(save_messages=False)
         p.shutdown()
         p._manager.flush_all.assert_not_called()
-        p._manager.shutdown.assert_not_called()
-        p._manager.stop_async_writer.assert_called_once()
+        p._manager.shutdown.assert_called_once()
+        assert p._manager.shutdown.call_args.kwargs["flush"] is False
+        p._manager.stop_async_writer.assert_not_called()
 
     def test_enabled_shuts_down_manager(self):
         p = self._provider_for_shutdown(save_messages=True)
