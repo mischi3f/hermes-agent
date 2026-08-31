@@ -1189,7 +1189,7 @@ class TestDialecticLifecycleSmoke:
 
         # ---- session end: flush messages ----
         provider.on_session_end([])
-        mgr.flush_all.assert_called()
+        mgr.flush_all_bounded.assert_called()
 
 
 class TestReasoningHeuristic:

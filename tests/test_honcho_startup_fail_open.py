@@ -200,7 +200,7 @@ def test_honcho_sync_turn_waits_for_full_background_startup(monkeypatch):
     try:
         assert session_created.wait(timeout=1)
         assert migration_started.wait(timeout=1)
-        assert provider._manager is not None
+        assert provider._manager is None
         assert provider._session_initialized is False
 
         provider.sync_turn("hello", "world")
@@ -260,7 +260,6 @@ def test_honcho_tools_eager_init_failure_does_not_leave_ready_manager(monkeypatc
     )
 
     def failing_session_init(self, cfg, session_id, **kwargs):
-        self._manager = SimpleNamespace()
         self._session_key = "test-session"
         raise RuntimeError("boom")
 

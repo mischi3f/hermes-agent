@@ -7,12 +7,22 @@ import queue
 import re
 import logging
 import threading
+import time
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
-from plugins.memory.honcho.client import get_honcho_client, spawn_context_thread
+from plugins.memory.honcho.client import (
+    HonchoClientLease,
+    acquire_honcho_client,
+    client_lease_snapshot,
+    close_honcho_client,
+    get_honcho_client,
+    lease_existing_honcho_client,
+    spawn_context_thread,
+)
 from plugins.memory.honcho.oauth import redact_tokens as _redact_tokens
 
 if TYPE_CHECKING:
@@ -130,6 +140,7 @@ class HonchoSessionManager:
         config: Any | None = None,
         runtime_user_peer_name: str | None = None,
         runtime_user_peer_name_alt: str | None = None,
+        client_lease: HonchoClientLease | None = None,
     ):
         """
         Initialize the session manager.
@@ -143,6 +154,13 @@ class HonchoSessionManager:
             runtime_user_peer_name_alt: Optional stable alternate gateway identity.
         """
         self._honcho = honcho
+        self._client_lease = client_lease
+        self._client_lease_lock = threading.RLock()
+        self._retire_client_on_idle = False
+        self._required_client_leases: list[HonchoClientLease] = []
+        if client_lease is not None:
+            self._required_client_leases.append(client_lease)
+        self._shutdown_close_client_required = True
         self._context_tokens = context_tokens
         self._config = config
         self._runtime_user_peer_name = runtime_user_peer_name
@@ -203,8 +221,155 @@ class HonchoSessionManager:
         self._async_queue: queue.Queue | None = None
         self._async_thread: threading.Thread | None = None
         self._async_thread_lock = threading.Lock()
+        self._shutdown_condition = threading.Condition(threading.RLock())
+        self._shutdown_state = "not_started"
+        self._shutdown_result: bool | None = None
+        self._shutdown_owner_ident: int | None = None
+        self._shutdown_recursive_failure = False
+        self._lifecycle_lock = threading.RLock()
+        self._shutdown_event = threading.Event()
+        self._owned_workers_lock = threading.Lock()
+        self._owned_workers: set[threading.Thread] = set()
+        self._owned_worker_results: weakref.WeakKeyDictionary[
+            threading.Thread, bool | None
+        ] = weakref.WeakKeyDictionary()
+        self._owned_worker_failed = False
+        self._flush_lock = threading.RLock()
         if write_frequency == "async":
             self._async_queue = queue.Queue()
+
+    def _start_owned_worker(
+        self,
+        target: Callable[[], object],
+        *,
+        name: str,
+        permit_shutdown: bool = False,
+        borrow_client: bool = True,
+    ) -> threading.Thread | None:
+        """Start and retain a manager-owned worker unless shutdown has begun."""
+        operation_lease = None
+        thread = None
+        start_failed = False
+
+        def _run() -> None:
+            succeeded = False
+            try:
+                succeeded = target() is not False
+            except BaseException:
+                logger.error(
+                    "honcho_worker status=failed reason=target_failed"
+                )
+            finally:
+                with self._owned_workers_lock:
+                    current = threading.current_thread()
+                    self._owned_worker_results[current] = succeeded
+                    if not succeeded:
+                        self._owned_worker_failed = True
+                    self._owned_workers.discard(current)
+                    no_workers = not self._owned_workers
+                if operation_lease is not None:
+                    operation_lease.release()
+                if no_workers:
+                    self._complete_deferred_client_retirement()
+
+        with self._shutdown_condition:
+            shutdown_worker_allowed = (
+                permit_shutdown
+                and self._shutdown_state == "in_progress"
+                and self._shutdown_owner_ident == threading.get_ident()
+            )
+            normal_worker_allowed = (
+                self._shutdown_state == "not_started"
+                and not self._shutdown_event.is_set()
+            )
+            if not normal_worker_allowed and not shutdown_worker_allowed:
+                logger.warning(
+                    "honcho_worker_admission status=rejected reason=shutdown_started"
+                )
+                return None
+            try:
+                thread = spawn_context_thread(_run, name=name, daemon=False)
+                with self._owned_workers_lock:
+                    if borrow_client:
+                        with self._client_lease_lock:
+                            if self._client_lease is not None:
+                                operation_lease = self._client_lease.borrow()
+                    self._owned_workers.add(thread)
+                    self._owned_worker_results[thread] = None
+                thread.start()
+            except BaseException:
+                with self._owned_workers_lock:
+                    if thread is not None:
+                        self._owned_workers.discard(thread)
+                        self._owned_worker_results.pop(thread, None)
+                    self._owned_worker_failed = True
+                start_failed = True
+
+        if start_failed:
+            if operation_lease is not None:
+                operation_lease.release()
+            logger.error("honcho_worker status=failed reason=start_failed")
+            return None
+        return thread
+
+    def _owned_worker_succeeded(self, worker: threading.Thread) -> bool:
+        """Return the finite completion result recorded by an owned worker."""
+        with self._owned_workers_lock:
+            return self._owned_worker_results.get(worker) is True
+
+    def _all_owned_workers_succeeded(self) -> bool:
+        """Return whether every completed owned worker finished successfully."""
+        with self._owned_workers_lock:
+            return not self._owned_worker_failed and all(
+                result is True for result in self._owned_worker_results.values()
+            )
+
+    def owned_worker_threads(self) -> list[threading.Thread]:
+        """Return the live workers whose lifecycle is owned by this manager."""
+        with self._owned_workers_lock:
+            workers = [thread for thread in self._owned_workers if thread.is_alive()]
+        async_thread = self._async_thread
+        if (
+            async_thread is not None
+            and async_thread.is_alive()
+            and async_thread not in workers
+        ):
+            workers.append(async_thread)
+        return workers
+
+    def shutdown_invariants_hold(self) -> bool:
+        """Return whether every required manager shutdown invariant is proven."""
+        with self._owned_workers_lock:
+            workers_ok = (
+                not self._owned_workers
+                and not self._owned_worker_failed
+                and all(
+                    result is True
+                    for result in self._owned_worker_results.values()
+                )
+            )
+        with self._client_lease_lock:
+            owner_released = (
+                not self._shutdown_close_client_required
+                or (
+                    self._client_lease is None
+                    and self._honcho is None
+                    and not self._retire_client_on_idle
+                )
+            )
+            required = list(self._required_client_leases)
+        generations_ok = True
+        if self._shutdown_close_client_required:
+            for lease in required:
+                state = client_lease_snapshot(lease)
+                if not (
+                    state["state"] == "closed"
+                    and state["active_leases"] == 0
+                    and state["close_result"] is True
+                ):
+                    generations_ok = False
+                    break
+        return workers_ok and owner_released and generations_ok
 
     @property
     def honcho(self) -> Honcho:
@@ -218,16 +383,76 @@ class HonchoSessionManager:
         that daemon threads cannot see, migrating every access onto the
         first-built profile's client (#69123, #74065).
         """
-        self._honcho = get_honcho_client(self._config)
-        return self._honcho
+        with self._client_lease_lock:
+            if self._client_lease is not None:
+                return self._client_lease.client
+            if self._honcho is not None:
+                return self._honcho
+            if self._shutdown_event.is_set():
+                if self._honcho is None:
+                    raise RuntimeError("Honcho session manager is shut down")
+                return self._honcho
+        client = get_honcho_client(self._config)
+        lease = lease_existing_honcho_client(client, self._config)
+        with self._client_lease_lock:
+            if self._shutdown_event.is_set():
+                lease.retire()
+                if self._honcho is None:
+                    raise RuntimeError("Honcho session manager is shut down")
+                return self._honcho
+            self._client_lease = lease
+            self._honcho = lease.client
+            if not any(
+                existing._record is lease._record
+                for existing in self._required_client_leases
+            ):
+                self._required_client_leases.append(lease)
+            return self._honcho
+
+    def _replace_client_generation(self) -> bool:
+        """Acquire a new generation before retiring the manager's old lease."""
+        with self._client_lease_lock:
+            current_lease = self._client_lease
+            use_managed_cache = current_lease is not None and not current_lease._legacy
+        if use_managed_cache:
+            replacement = acquire_honcho_client(self._config)
+        else:
+            client = get_honcho_client(self._config)
+            replacement = lease_existing_honcho_client(client, self._config)
+        with self._client_lease_lock:
+            previous = self._client_lease
+            self._client_lease = replacement
+            self._honcho = replacement.client
+            if not any(
+                existing._record is replacement._record
+                for existing in self._required_client_leases
+            ):
+                self._required_client_leases.append(replacement)
+        if previous is not None:
+            previous.retire()
+        return True
+
+    def _complete_deferred_client_retirement(self) -> bool:
+        """Retire the manager lease once its final worker has exited."""
+        with self._client_lease_lock:
+            if not self._retire_client_on_idle:
+                return True
+            lease = self._client_lease
+            client = self._honcho
+            self._client_lease = None
+            self._honcho = None
+            self._retire_client_on_idle = False
+        if lease is not None:
+            return lease.retire()
+        if client is not None:
+            return close_honcho_client(client, self._config)
+        return True
 
     def _record_auth_failure(self, exc: BaseException) -> None:
         detail = _redact_tokens(str(exc))
         if self._auth_failure is None:
             logger.error(
-                "Honcho authentication failed and token refresh did not recover; "
-                "memory sync and recall are paused until the user re-authenticates: %s",
-                detail,
+                "honcho_auth status=failed reason=refresh_rejected"
             )
         self._auth_failure = detail
 
@@ -295,14 +520,18 @@ class HonchoSessionManager:
                 return False
             if not oauth.apply_token_to_client(self.honcho, token):
                 # SDK shape changed: rebuild the client and drop objects holding the old transport.
-                reset_honcho_client()
+                if reset_honcho_client(self._config) is False:
+                    return False
+                self._replace_client_generation()
                 with self._cache_lock:
                     self._client_generation += 1
                     self._peers_cache.clear()
                     self._sessions_cache.clear()
             return True
         except Exception:
-            logger.warning("Honcho post-401 token refresh failed", exc_info=True)
+            logger.warning(
+                "honcho_client_refresh status=failed reason=post401_refresh_failed"
+            )
             return False
 
     def _authed_call(self, op_name: str, operation: Callable[[], Any]) -> Any:
@@ -659,6 +888,11 @@ class HonchoSessionManager:
 
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
+        with self._flush_lock:
+            return self._flush_session_locked(session)
+
+    def _flush_session_locked(self, session: HonchoSession) -> bool:
+        """Write one session while serializing async and shutdown flushes."""
         if not session.messages:
             return True
 
@@ -746,77 +980,259 @@ class HonchoSessionManager:
           "session" — defer until flush_session() is called explicitly
           N (int)   — flush every N turns
         """
-        self._turn_counter += 1
-        wf = self._write_frequency
+        with self._lifecycle_lock:
+            if self._shutdown_event.is_set():
+                logger.warning("Honcho manager is shutting down; rejecting late save")
+                return
+            self._turn_counter += 1
+            wf = self._write_frequency
 
-        if wf == "async":
-            if self._async_queue is not None:
-                self._ensure_async_writer()
-                self._async_queue.put(session)
-        elif wf == "turn":
-            self._flush_session(session)
-        elif wf == "session":
-            # Accumulate; caller must call flush_all() at session end
-            pass
-        elif isinstance(wf, int) and wf > 0:
-            if self._turn_counter % wf == 0:
+            if wf == "async":
+                if self._async_queue is not None:
+                    self._ensure_async_writer()
+                    self._async_queue.put(session)
+            elif wf == "turn":
                 self._flush_session(session)
+            elif wf == "session":
+                # Accumulate; caller must call flush_all() at session end
+                pass
+            elif isinstance(wf, int) and wf > 0:
+                if self._turn_counter % wf == 0:
+                    self._flush_session(session)
 
-    def flush_all(self) -> None:
+    def flush_all(self) -> bool:
         """Flush all pending unsynced messages for all cached sessions.
 
         Called at session end for "session" write_frequency, or to force
         a sync before process exit regardless of mode.
         """
+        succeeded = True
         with self._cache_lock:
             sessions = list(self._cache.values())
         for session in sessions:
             try:
-                self._flush_session(session)
-            except Exception as e:
-                logger.error("Honcho flush_all error for %s: %s", session.key, e)
+                if self._flush_session(session) is False:
+                    succeeded = False
+            except BaseException:
+                logger.error(
+                    "honcho_shutdown status=failed reason=session_flush_failed"
+                )
+                succeeded = False
 
         # Drain async queue synchronously if it exists
+        queued_sessions = []
         if self._async_queue is not None:
-            while not self._async_queue.empty():
-                try:
-                    item = self._async_queue.get_nowait()
-                    if item is not _ASYNC_SHUTDOWN:
-                        self._flush_session(item)
-                except queue.Empty:
-                    break
+            with self._lifecycle_lock:
+                while not self._async_queue.empty():
+                    try:
+                        item = self._async_queue.get_nowait()
+                        if item is _ASYNC_SHUTDOWN:
+                            self._async_queue.put_nowait(_ASYNC_SHUTDOWN)
+                            break
+                        queued_sessions.append(item)
+                    except queue.Empty:
+                        break
+        for item in queued_sessions:
+            try:
+                if self._flush_session(item) is False:
+                    succeeded = False
+            except BaseException:
+                logger.error(
+                    "honcho_shutdown status=failed reason=queued_flush_failed"
+                )
+                succeeded = False
+        return succeeded
+
+    def flush_all_bounded(
+        self,
+        timeout: float,
+        *,
+        worker_name: str = "honcho-session-end-flush",
+        permit_shutdown: bool = False,
+    ) -> bool:
+        """Run ``flush_all`` in an owned worker bounded by one deadline."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        worker = self._start_owned_worker(
+            self.flush_all,
+            name=worker_name,
+            permit_shutdown=permit_shutdown,
+        )
+        if worker is None:
+            return False
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not worker.is_alive() and self._owned_worker_succeeded(worker)
 
     def _ensure_async_writer(self) -> None:
         """Start the async writer on first enqueue (idempotent, thread-safe)."""
-        if self._async_thread is not None and self._async_thread.is_alive():
-            return
-        with self._async_thread_lock:
+        with self._lifecycle_lock, self._async_thread_lock:
+            if self._shutdown_event.is_set():
+                return
             if self._async_thread is None or not self._async_thread.is_alive():
-                self._async_thread = spawn_context_thread(
+                self._async_thread = self._start_owned_worker(
                     self._async_writer_loop,
                     name="honcho-async-writer",
                 )
-                self._async_thread.start()
 
-    def stop_async_writer(self) -> None:
+    def stop_async_writer(self, timeout: float = 10.0) -> bool:
         """Stop the async writer thread WITHOUT flushing pending messages.
 
         Used on shutdown when persistence is disabled (saveMessages: false):
         the thread must still be joined so process exit is clean, but nothing
         may be written.
         """
-        if self._async_queue is not None:
-            if self._async_thread is not None and self._async_thread.is_alive():
-                self._async_queue.put(_ASYNC_SHUTDOWN)
-                self._async_thread.join(timeout=10)
+        return self.shutdown(timeout=timeout, flush=False)
 
-    def shutdown(self) -> None:
-        """Gracefully shut down the async writer thread."""
-        if self._async_queue is not None:
-            self.flush_all()
-            if self._async_thread is not None and self._async_thread.is_alive():
-                self._async_queue.put(_ASYNC_SHUTDOWN)
-                self._async_thread.join(timeout=10)
+    def shutdown(
+        self,
+        timeout: float = 10.0,
+        *,
+        flush: bool = True,
+        close_client: bool = True,
+    ) -> bool:
+        """Run one cached shutdown operation shared by every caller.
+
+        A recursive call from the owner thread returns ``False`` immediately
+        and poisons the outer operation. Other concurrent callers wait for the
+        first caller's bounded operation and receive its immutable result.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        caller_ident = threading.get_ident()
+        with self._shutdown_condition:
+            if self._shutdown_state == "finished":
+                return self._shutdown_result is True
+            if self._shutdown_state == "in_progress":
+                if self._shutdown_owner_ident == caller_ident:
+                    self._shutdown_recursive_failure = True
+                    return False
+                while self._shutdown_state != "finished":
+                    self._shutdown_condition.wait()
+                return self._shutdown_result is True
+
+            self._shutdown_state = "in_progress"
+            self._shutdown_owner_ident = caller_ident
+            self._shutdown_close_client_required = close_client
+
+        result = False
+        try:
+            result = self._perform_shutdown(deadline, flush, close_client)
+        except BaseException:
+            logger.error(
+                "honcho_shutdown status=failed reason=manager_shutdown_failed"
+            )
+        finally:
+            with self._shutdown_condition:
+                if self._shutdown_recursive_failure:
+                    result = False
+                self._shutdown_result = bool(result)
+                self._shutdown_state = "finished"
+                self._shutdown_owner_ident = None
+                self._shutdown_condition.notify_all()
+        return self._shutdown_result is True
+
+    def _perform_shutdown(
+        self,
+        deadline: float,
+        flush: bool,
+        close_client: bool,
+    ) -> bool:
+        """Perform the single manager teardown operation to ``deadline``."""
+        if not self._lifecycle_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            return False
+        try:
+            with self._owned_workers_lock:
+                self._shutdown_event.set()
+        finally:
+            self._lifecycle_lock.release()
+
+        flush_ok = True
+        if flush:
+            flush_ok = self.flush_all_bounded(
+                max(0.0, deadline - time.monotonic()),
+                worker_name="honcho-shutdown-flush",
+                permit_shutdown=True,
+            )
+            if not flush_ok:
+                logger.error(
+                    "honcho_shutdown status=failed reason=flush_failed"
+                )
+
+        async_thread = self._async_thread
+        if (
+            self._async_queue is not None
+            and async_thread is not None
+            and async_thread.is_alive()
+        ):
+            # Admission was closed under _lifecycle_lock above, so every
+            # previously admitted save has already queued before this
+            # non-blocking sentinel and no new save can follow it.
+            self._async_queue.put_nowait(_ASYNC_SHUTDOWN)
+            async_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        with self._owned_workers_lock:
+            workers = list(self._owned_workers)
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        alive = self.owned_worker_threads()
+        if alive:
+            with self._client_lease_lock:
+                self._retire_client_on_idle = True
+            logger.error(
+                "honcho_shutdown status=failed "
+                "reason=worker_deadline_exceeded worker_count=%d",
+                len(alive),
+            )
+            return False
+
+        client_ok = self._close_client_bounded(deadline) if close_client else True
+        alive = self.owned_worker_threads()
+        if alive:
+            logger.error(
+                "honcho_shutdown status=failed "
+                "reason=worker_deadline_exceeded worker_count=%d",
+                len(alive),
+            )
+            return False
+        return (
+            flush_ok
+            and client_ok
+            and self._all_owned_workers_succeeded()
+            and self.shutdown_invariants_hold()
+        )
+
+    def _close_client_bounded(self, deadline: float) -> bool:
+        """Close the owned Honcho HTTP transport within the outer deadline."""
+        with self._client_lease_lock:
+            lease = self._client_lease
+            client = self._honcho
+            if lease is not None:
+                self._retire_client_on_idle = True
+        if lease is None and client is None:
+            return True
+        target = (
+            self._complete_deferred_client_retirement
+            if lease is not None
+            else lambda: close_honcho_client(client, self._config)
+        )
+        worker = self._start_owned_worker(
+            target,
+            name="honcho-http-close",
+            permit_shutdown=True,
+            borrow_client=False,
+        )
+        if worker is None:
+            return False
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if worker.is_alive():
+            logger.error(
+                "honcho_shutdown status=failed reason=http_close_deadline_exceeded"
+            )
+            return False
+        if lease is None:
+            self._honcho = None
+        return self._owned_worker_succeeded(worker)
 
     def delete(self, key: str) -> bool:
         """Delete a session from local cache."""
@@ -964,8 +1380,7 @@ class HonchoSessionManager:
             if result:
                 self.set_context_result(session_key, result)
 
-        t = spawn_context_thread(_run, name="honcho-context-prefetch")
-        t.start()
+        self._start_owned_worker(_run, name="honcho-context-prefetch")
 
     def set_context_result(self, session_key: str, result: dict[str, str]) -> None:
         """Store a prefetched context result in a thread-safe way."""

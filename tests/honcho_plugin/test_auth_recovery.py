@@ -735,7 +735,7 @@ def _wire_rebuild(tmp_path, monkeypatch, fresh_client):
     monkeypatch.setattr(oauth, "apply_token_to_client", lambda c, t: False)
     monkeypatch.setattr(
         client_mod, "reset_honcho_client",
-        lambda: clients.__setitem__("current", fresh_client),
+        lambda *_args: clients.__setitem__("current", fresh_client),
     )
     return clients
 

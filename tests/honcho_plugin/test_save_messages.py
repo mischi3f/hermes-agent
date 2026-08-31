@@ -66,12 +66,12 @@ class TestOnSessionEnd:
     def test_disabled_skips_flush(self):
         p = _provider(save_messages=False)
         p.on_session_end([])
-        p._manager.flush_all.assert_not_called()
+        p._manager.flush_all_bounded.assert_not_called()
 
     def test_enabled_flushes(self):
         p = _provider(save_messages=True)
         p.on_session_end([])
-        p._manager.flush_all.assert_called_once()
+        p._manager.flush_all_bounded.assert_called_once()
 
 
 class TestShutdown:
@@ -91,14 +91,19 @@ class TestShutdown:
 
     def test_disabled_skips_flush_but_stops_writer(self):
         p = self._provider_for_shutdown(save_messages=False)
+        manager = p._manager
         p.shutdown()
-        p._manager.flush_all.assert_not_called()
-        p._manager.shutdown.assert_not_called()
-        p._manager.stop_async_writer.assert_called_once()
+        manager.flush_all.assert_not_called()
+        manager.shutdown.assert_called_once()
+        assert manager.shutdown.call_args.kwargs["flush"] is False
+        assert p._manager is None
 
     def test_enabled_shuts_down_manager(self):
         p = self._provider_for_shutdown(save_messages=True)
+        manager = p._manager
         p.shutdown()
         # manager.shutdown() flushes AND joins the async-writer thread;
         # calling flush_all() alone left the writer thread alive at exit.
-        p._manager.shutdown.assert_called_once()
+        manager.shutdown.assert_called_once()
+        assert manager.shutdown.call_args.kwargs["flush"] is True
+        assert p._manager is None

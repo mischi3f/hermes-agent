@@ -14,6 +14,16 @@ import threading
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolated_client_registry():
+    """Keep process-wide client generations isolated between unit tests."""
+    from plugins.memory.honcho import client as client_module
+
+    client_module._reset_client_registry_for_tests()
+    yield
+    client_module._reset_client_registry_for_tests()
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",

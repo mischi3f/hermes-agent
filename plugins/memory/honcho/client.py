@@ -950,6 +950,56 @@ _client_slots: dict[tuple, SingletonSlot] = {}
 _client_slots_lock = _threading.Lock()
 
 
+@dataclass
+class _ClientGeneration:
+    """Lifecycle state for one exact cached client generation."""
+
+    key: tuple
+    generation: int
+    client: object
+    slot: SingletonSlot
+    state: str = "live"
+    active_leases: int = 0
+    finished: _threading.Event = field(default_factory=_threading.Event)
+    close_result: bool | None = None
+
+
+_client_generation_counters: dict[tuple, int] = {}
+_client_current_generations: dict[tuple, _ClientGeneration] = {}
+_client_generations_by_id: dict[int, _ClientGeneration] = {}
+_client_generation_history: list[_ClientGeneration] = []
+_pending_generation_closes: list[_ClientGeneration] = []
+_client_blocked_keys: set[tuple] = set()
+
+
+class HonchoClientLease:
+    """One explicit use lease for an exact client generation."""
+
+    __slots__ = ("_record", "_released", "_legacy")
+
+    def __init__(self, record: _ClientGeneration, *, legacy: bool = False):
+        self._record = record
+        self._released = False
+        self._legacy = legacy
+
+    @property
+    def client(self):
+        return self._record.client
+
+    def borrow(self) -> "HonchoClientLease":
+        with _client_slots_lock:
+            if self._released or self._record.state in {"closing", "closed"}:
+                raise RuntimeError("Honcho client generation is unavailable")
+            self._record.active_leases += 1
+            return HonchoClientLease(self._record, legacy=self._legacy)
+
+    def release(self) -> bool:
+        return _release_client_lease(self, retire=False)
+
+    def retire(self) -> bool:
+        return _release_client_lease(self, retire=True)
+
+
 def spawn_context_thread(
     target,
     *,
@@ -1056,8 +1106,162 @@ def _client_cache_key(config: HonchoClientConfig | None) -> tuple:
     )
 
 
-def _slot_for(key: tuple) -> SingletonSlot:
-    """Return the slot for ``key``, evicting stale same-identity slots.
+def _claim_generation_close_locked(record: _ClientGeneration) -> None:
+    """Claim exactly-once close when a retiring generation has no users."""
+    if record.state == "retiring" and record.active_leases == 0:
+        record.state = "closing"
+        _pending_generation_closes.append(record)
+
+
+def _retire_generation_locked(record: _ClientGeneration) -> None:
+    """Retire one generation without affecting any newer generation."""
+    if record.state == "live":
+        record.state = "retiring"
+    if _client_current_generations.get(record.key) is record:
+        _client_current_generations.pop(record.key, None)
+    if _client_slots.get(record.key) is record.slot:
+        _client_slots.pop(record.key, None)
+    _claim_generation_close_locked(record)
+
+
+def _register_generation_locked(
+    key: tuple,
+    client: object,
+    slot: SingletonSlot,
+) -> _ClientGeneration:
+    """Return the current record for ``client`` or register a new generation."""
+    current = _client_current_generations.get(key)
+    if current is not None and current.client is client and current.state == "live":
+        return current
+    if current is not None:
+        _retire_generation_locked(current)
+    generation = _client_generation_counters.get(key, 0) + 1
+    _client_generation_counters[key] = generation
+    record = _ClientGeneration(
+        key=key,
+        generation=generation,
+        client=client,
+        slot=slot,
+    )
+    _client_current_generations[key] = record
+    _client_generations_by_id[id(client)] = record
+    _client_generation_history.append(record)
+    return record
+
+
+def _close_generation_transport(record: _ClientGeneration) -> bool:
+    """Close one claimed generation without exposing exception content."""
+    result = False
+    try:
+        transport = getattr(record.client, "_http", None)
+        close = getattr(transport, "close", None)
+        if not callable(close):
+            logger.error(
+                "honcho_shutdown status=failed reason=http_close_unavailable"
+            )
+        else:
+            close()
+            result = True
+    except BaseException:
+        logger.error("honcho_shutdown status=failed reason=http_close_failed")
+    finally:
+        with _client_slots_lock:
+            record.close_result = result
+            record.state = "closed"
+            record.finished.set()
+    return result
+
+
+def _drain_pending_generation_closes() -> bool:
+    """Close every claimed generation outside the registry lock."""
+    succeeded = True
+    while True:
+        with _client_slots_lock:
+            if not _pending_generation_closes:
+                return succeeded
+            record = _pending_generation_closes.pop(0)
+        succeeded = _close_generation_transport(record) and succeeded
+
+
+def _release_client_lease(lease: HonchoClientLease, *, retire: bool) -> bool:
+    """Release one lease and close its retiring generation when last."""
+    with _client_slots_lock:
+        if lease._released:
+            return lease._record.close_result is not False
+        lease._released = True
+        record = lease._record
+        record.active_leases -= 1
+        if retire:
+            _retire_generation_locked(record)
+        else:
+            _claim_generation_close_locked(record)
+    _drain_pending_generation_closes()
+    return record.close_result is not False
+
+
+def client_registry_snapshot() -> list[dict[str, object]]:
+    """Return finite lifecycle state for deterministic tests."""
+    with _client_slots_lock:
+        return [
+            {
+                "generation": record.generation,
+                "state": record.state,
+                "active_leases": record.active_leases,
+                "close_result": record.close_result,
+            }
+            for record in _client_generation_history
+        ]
+
+
+def client_lease_snapshot(lease: HonchoClientLease) -> dict[str, object]:
+    """Return finite state for the exact generation referenced by ``lease``."""
+    with _client_slots_lock:
+        record = lease._record
+        return {
+            "generation": record.generation,
+            "state": record.state,
+            "active_leases": record.active_leases,
+            "close_result": record.close_result,
+            "released": lease._released,
+        }
+
+
+def validate_client_registry_invariants() -> bool:
+    """Validate finite ownership invariants for deterministic tests."""
+    with _client_slots_lock:
+        seen: set[tuple[tuple, int]] = set()
+        for record in _client_generation_history:
+            identity = (record.key, record.generation)
+            if identity in seen:
+                raise AssertionError("duplicate client generation")
+            seen.add(identity)
+            if record.active_leases < 0:
+                raise AssertionError("negative client lease count")
+            if record.state in {"closing", "closed"} and record.active_leases:
+                raise AssertionError("closing client generation has active leases")
+            if record.state == "closed" and not record.finished.is_set():
+                raise AssertionError("closed client generation lacks final result")
+        for record in _client_current_generations.values():
+            if record.state != "live":
+                raise AssertionError("non-live client generation is current")
+        return True
+
+
+def _reset_client_registry_for_tests() -> None:
+    """Clear client lifecycle state between isolated unit tests."""
+    with _client_slots_lock:
+        _client_slots.clear()
+        _client_current_generations.clear()
+        _client_generations_by_id.clear()
+        _client_generation_history.clear()
+        _client_generation_counters.clear()
+        _pending_generation_closes.clear()
+        _client_blocked_keys.clear()
+    _honcho_client_slot.reset()
+
+
+def _slot_for_locked(key: tuple) -> SingletonSlot:
+    """Return the slot for ``key`` while the caller holds the cache lock.
 
     When a (kind, host, config_path/hermes_home) identity reappears with a
     DIFFERENT credential fingerprint or timeout, the old slot is dropped so
@@ -1067,20 +1271,22 @@ def _slot_for(key: tuple) -> SingletonSlot:
     machinery inert.
     """
     identity = key[:3] if key[0] == "ambient" else (key[0], key[1], key[5], key[6])
-    with _client_slots_lock:
-        slot = _client_slots.get(key)
-        if slot is None:
-            stale = [
-                k for k in _client_slots
-                if k != key and (
-                    (k[:3] if k[0] == "ambient" else (k[0], k[1], k[5], k[6])) == identity
-                )
-            ]
-            for k in stale:
-                _client_slots.pop(k, None)
-            slot = SingletonSlot()
-            _client_slots[key] = slot
-        return slot
+    slot = _client_slots.get(key)
+    if slot is None:
+        stale = [
+            k for k in _client_slots
+            if k != key and (
+                (k[:3] if k[0] == "ambient" else (k[0], k[1], k[5], k[6])) == identity
+            )
+        ]
+        for k in stale:
+            stale_record = _client_current_generations.get(k)
+            if stale_record is not None:
+                _retire_generation_locked(stale_record)
+            _client_slots.pop(k, None)
+        slot = SingletonSlot()
+        _client_slots[key] = slot
+    return slot
 # Memo for the honcho.json-derived timeout, keyed PER CONFIG PATH on the
 # file's mtime_ns so the staleness check on every get_honcho_client() call
 # costs one stat() instead of a JSON parse. Path-keyed because multi-profile
@@ -1177,7 +1383,9 @@ def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
         if token:
             config.api_key = token
     except Exception:
-        logger.warning("Honcho OAuth pre-build refresh failed", exc_info=True)
+        logger.warning(
+            "honcho_client_refresh status=failed reason=prebuild_refresh_failed"
+        )
 
 
 def _refresh_cached_oauth(
@@ -1205,10 +1413,16 @@ def _refresh_cached_oauth(
             if slot is not None:
                 slot.reset()
     except Exception:
-        logger.warning("Honcho OAuth cached refresh failed", exc_info=True)
+        logger.warning(
+            "honcho_client_refresh status=failed reason=cached_refresh_failed"
+        )
 
 
-def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
+def get_honcho_client(
+    config: HonchoClientConfig | None = None,
+    *,
+    _lease: bool = False,
+):
     """Get or create the Honcho client for this config's identity.
 
     Clients are cached PER IDENTITY (host, workspace, provenance paths,
@@ -1227,15 +1441,6 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
     connection.
     """
     key = _client_cache_key(config)
-    slot = _slot_for(key)
-    cached = slot.peek()
-    if cached is not None:
-        _refresh_cached_oauth(cached, config, slot)
-        refreshed = slot.peek()
-        if refreshed is not None:
-            return refreshed
-        # Slot was reset by a failed in-place rotation — rebuild below.
-
     if config is None:
         config = HonchoClientConfig.from_global_config()
 
@@ -1356,12 +1561,125 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
 
         return Honcho(**kwargs)
 
-    return slot.get(_build)
-
-
-def reset_honcho_client() -> None:
-    """Reset all cached Honcho clients (tests, OAuth re-login)."""
     with _client_slots_lock:
-        _client_slots.clear()
-    _honcho_client_slot.reset()
+        if key in _client_blocked_keys:
+            raise RuntimeError("Honcho client cache is unavailable")
+        slot = _slot_for_locked(key)
+        cached = slot.peek()
+        if cached is not None:
+            _refresh_cached_oauth(cached, config, slot)
+            refreshed = slot.peek()
+            if refreshed is not None:
+                client = refreshed
+            else:
+                client = slot.get(_build)
+            # Slot was reset by a failed in-place rotation — rebuild below.
+        else:
+            client = slot.get(_build)
+        record = _register_generation_locked(key, client, slot)
+        if _lease:
+            record.active_leases += 1
+            result = HonchoClientLease(record)
+        else:
+            result = client
+    _drain_pending_generation_closes()
+    return result
+
+
+_get_honcho_client_impl = get_honcho_client
+
+
+def acquire_honcho_client(
+    config: HonchoClientConfig | None = None,
+) -> HonchoClientLease:
+    """Acquire one explicit lease for the current client generation."""
+    if get_honcho_client is _get_honcho_client_impl:
+        return _get_honcho_client_impl(config, _lease=True)
+    client = get_honcho_client(config)
+    return lease_existing_honcho_client(client, config)
+
+
+def lease_existing_honcho_client(
+    client: object,
+    config: HonchoClientConfig | None = None,
+) -> HonchoClientLease:
+    """Register and lease a client acquired through a legacy/test seam."""
+    try:
+        key = _client_cache_key(config)
+    except (AttributeError, TypeError, ValueError):
+        key = ("legacy", id(config))
+    with _client_slots_lock:
+        slot = _client_slots.get(key) or SingletonSlot()
+        record = _register_generation_locked(key, client, slot)
+        record.active_leases += 1
+        return HonchoClientLease(record, legacy=True)
+
+
+def close_honcho_client(
+    client: "Honcho", config: HonchoClientConfig | None = None
+) -> bool:
+    """Retire one exact client generation and close when no leases remain."""
+    key = _client_cache_key(config)
+    with _client_slots_lock:
+        record = _client_generations_by_id.get(id(client))
+        if record is None or record.client is not client:
+            slot = _client_slots.get(key) or SingletonSlot()
+            generation = _client_generation_counters.get(key, 0) + 1
+            _client_generation_counters[key] = generation
+            record = _ClientGeneration(
+                key=key,
+                generation=generation,
+                client=client,
+                slot=slot,
+            )
+            _client_generations_by_id[id(client)] = record
+            _client_generation_history.append(record)
+        if record.state == "closed":
+            return record.close_result is True
+        if record.state == "closing":
+            finished = record.finished
+            wait_for_close = True
+        else:
+            _client_blocked_keys.add(key)
+            _retire_generation_locked(record)
+            finished = record.finished
+            wait_for_close = record.state == "closing"
+    if _honcho_client_slot.peek() is client:
+        _honcho_client_slot.reset()
+    _drain_pending_generation_closes()
+    if wait_for_close:
+        finished.wait()
+    with _client_slots_lock:
+        return record.close_result is True
+
+
+def reset_honcho_client(config: HonchoClientConfig | None = None) -> bool:
+    """Advance selected cache generations; fail if their close is in progress."""
+    selected_key = _client_cache_key(config) if config is not None else None
+    with _client_slots_lock:
+        selected = [
+            record
+            for record in _client_generation_history
+            if selected_key is None or record.key == selected_key
+        ]
+        if any(record.state == "closing" for record in selected):
+            return False
+        current = [
+            record
+            for record in _client_current_generations.values()
+            if selected_key is None or record.key == selected_key
+        ]
+        if selected_key is None:
+            _client_blocked_keys.clear()
+        else:
+            _client_blocked_keys.discard(selected_key)
+        for record in current:
+            _retire_generation_locked(record)
+        if selected_key is None:
+            _client_slots.clear()
+        else:
+            _client_slots.pop(selected_key, None)
+    if selected_key is None:
+        _honcho_client_slot.reset()
     _honcho_json_timeout_memo.clear()
+    return _drain_pending_generation_closes()
