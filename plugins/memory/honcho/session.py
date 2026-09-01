@@ -23,6 +23,7 @@ from plugins.memory.honcho.client import (
     lease_existing_honcho_client,
     spawn_context_thread,
 )
+from plugins.memory.honcho.context_selection import select_complete_context
 from plugins.memory.honcho.oauth import redact_tokens as _redact_tokens
 
 if TYPE_CHECKING:
@@ -1286,6 +1287,7 @@ class HonchoSessionManager:
         peer: str = "user",
         apply_injection_cap: bool = True,
         raise_errors: bool = False,
+        relevance_query: str | None = None,
     ) -> str:
         """
         Query Honcho's dialectic endpoint about a peer.
@@ -1358,7 +1360,11 @@ class HonchoSessionManager:
                 and self._dialectic_max_chars
                 and len(result) > self._dialectic_max_chars
             ):
-                result = result[:self._dialectic_max_chars].rsplit(" ", 1)[0] + " …"
+                result = select_complete_context(
+                    result,
+                    relevance_query or query,
+                    self._dialectic_max_chars,
+                )
             return result
         except HonchoAuthError:
             raise

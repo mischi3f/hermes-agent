@@ -419,8 +419,8 @@ class TestChunkMessage:
 
 
 class TestTruncateToBudget:
-    def test_truncates_oversized_context(self):
-        """Text exceeding context_tokens budget is truncated at a word boundary."""
+    def test_omits_oversized_context_without_complete_sentence(self):
+        """Oversized text without a complete unit is omitted, not raw-sliced."""
         from plugins.memory.honcho.client import HonchoClientConfig
 
         provider = HonchoMemoryProvider()
@@ -429,8 +429,7 @@ class TestTruncateToBudget:
         long_text = "word " * 200  # ~1000 chars, well over 10*4=40 char budget
         result = provider._truncate_to_budget(long_text)
 
-        assert len(result) <= 50  # budget_chars + ellipsis + word boundary slack
-        assert result.endswith(" …")
+        assert result == ""
 
 
     def test_context_tokens_cap_bounds_prefetch(self):
@@ -503,15 +502,14 @@ class TestDialecticInjectionCap:
         mgr._get_or_create_peer = MagicMock(return_value=mock_peer)
         return mgr
 
-    def test_injection_path_truncates(self):
-        """Default (auto-injection) path clips to dialecticMaxChars with an ellipsis."""
+    def test_injection_path_omits_incomplete_monolithic_text(self):
+        """Auto-injection never emits a raw incomplete prefix."""
         answer = "fact " * 100  # 500 chars, well over the 50-char cap
         mgr = self._manager_with_long_answer(answer)
 
         result = mgr.dialectic_query("test", "summarize")
 
-        assert len(result) <= 60  # cap + word-boundary slack + ellipsis
-        assert result.endswith(" …")
+        assert result == ""
 
     def test_tool_path_returns_full_answer(self):
         """Explicit tool call (apply_injection_cap=False) returns the full answer."""

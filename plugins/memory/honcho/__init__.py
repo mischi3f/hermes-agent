@@ -32,6 +32,10 @@ from plugins.memory.honcho.client import (
     close_honcho_client,
     spawn_context_thread,
 )
+from plugins.memory.honcho.context_selection import (
+    assemble_context_layers,
+    select_complete_context,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -1000,6 +1004,7 @@ class HonchoMemoryProvider(MemoryProvider):
             return self._truncate_to_budget(ready) if ready else ""
 
         parts = []
+        base_context = ""
 
         # One-time notice, relayed by the model, that auth is dead and memory is paused.
         auth_notice = self._pop_auth_notice()
@@ -1129,11 +1134,14 @@ class HonchoMemoryProvider(MemoryProvider):
         if not parts:
             return ""
 
-        result = "\n\n".join(parts)
-
-        result = self._truncate_to_budget(result)
-
-        return result
+        if self._config and self._config.context_tokens:
+            return assemble_context_layers(
+                base_context=base_context,
+                dialectic_context=dialectic_result,
+                notice_context=auth_notice,
+                max_chars=self._config.context_tokens * 4,
+            )
+        return "\n\n".join(parts)
 
     def _pop_auth_notice(self) -> str:
         """One-time model-facing notice that Honcho auth expired and memory is paused."""
@@ -1184,12 +1192,7 @@ class HonchoMemoryProvider(MemoryProvider):
         budget_chars = self._config.context_tokens * 4  # conservative char estimate
         if len(text) <= budget_chars:
             return text
-        # Truncate at word boundary
-        truncated = text[:budget_chars]
-        last_space = truncated.rfind(" ")
-        if last_space > budget_chars * 0.8:
-            truncated = truncated[:last_space]
-        return truncated + " …"
+        return select_complete_context(text, "", budget_chars)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire background prefetch threads for the upcoming turn.
@@ -1512,6 +1515,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._session_key, prompt,
                 reasoning_level=level,
                 peer="user",
+                relevance_query=query,
             )
             results.append(result or "")
 
