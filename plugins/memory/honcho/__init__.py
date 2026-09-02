@@ -303,6 +303,11 @@ class HonchoMemoryProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
+        self._prewarm_thread: Optional[threading.Thread] = None
+        self._generic_prewarm_state = "not_started"
+        self._generic_prewarm_result = ""
+        self._generic_prewarm_generation = 0
+        self._dialectic_generation = 0
         self._sync_thread: Optional[threading.Thread] = None
 
         self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
@@ -778,6 +783,8 @@ class HonchoMemoryProvider(MemoryProvider):
                         "Summarize what you know about this user. "
                         "Focus on preferences, current projects, and working style."
                     )
+                    with self._prefetch_lock:
+                        _prewarm_generation = self._generic_prewarm_generation
 
                     def _prewarm_dialectic() -> None:
                         try:
@@ -786,23 +793,23 @@ class HonchoMemoryProvider(MemoryProvider):
                             )
                         except Exception as exc:
                             logger.debug("Honcho dialectic prewarm failed: %s", exc)
-                            self._note_dialectic_failure(exc)
-                            return
-                        if r and r.strip():
                             with self._prefetch_lock:
-                                self._prefetch_result = r
-                                self._prefetch_result_fired_at = 0
-                            self._last_dialectic_turn = 0
-                            self._dialectic_empty_streak = 0
-                        else:
-                            self._dialectic_empty_streak += 1
+                                if _prewarm_generation != self._generic_prewarm_generation:
+                                    return
+                                self._generic_prewarm_state = "failed"
+                            return
+                        with self._prefetch_lock:
+                            if _prewarm_generation != self._generic_prewarm_generation:
+                                return
+                            self._generic_prewarm_state = "ready"
+                            self._generic_prewarm_result = r if r and r.strip() else ""
 
                     self._prefetch_thread_started_at = time.monotonic()
                     prewarm_thread = self._start_owned_worker(
                         _prewarm_dialectic,
                         name="honcho-prewarm-dialectic",
                     )
-                    self._prefetch_thread = prewarm_thread
+                    self._prewarm_thread = prewarm_thread
                     if prewarm_thread is not None:
                         logger.debug("Honcho dialectic prewarm started for session: %s", self._session_key)
                 else:
@@ -1074,11 +1081,6 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # ----- Layer 2: Dialectic supplement -----
         # Turn 1 may briefly wait for dialectic; unfinished work remains async.
-        with self._prefetch_lock:
-            _prewarm_landed = bool(self._prefetch_result)
-        if _prewarm_landed and self._last_dialectic_turn == -999:
-            self._last_dialectic_turn = self._turn_count
-
         if self._last_dialectic_turn == -999 and query:
             # Reuse an in-flight prewarm; otherwise start one dialectic. A short
             # request timeout may tighten, but never expand, the turn-1 wait.
@@ -1093,23 +1095,18 @@ class HonchoMemoryProvider(MemoryProvider):
             else:
                 _first_turn_timeout = _dia_wait
                 _fired_at = self._turn_count
+                with self._prefetch_lock:
+                    self._dialectic_generation += 1
+                    _generation = self._dialectic_generation
 
                 def _run_first_turn() -> None:
                     try:
                         r = self._run_dialectic_depth(query)
                     except Exception as exc:
                         logger.debug("Honcho first-turn dialectic failed: %s", exc)
-                        self._note_dialectic_failure(exc)
+                        self._note_dialectic_failure(exc, generation=_generation)
                         return
-                    if r and r.strip():
-                        with self._prefetch_lock:
-                            self._prefetch_result = r
-                            self._prefetch_result_fired_at = _fired_at
-                        # Empty results do not consume the cadence window.
-                        self._last_dialectic_turn = _fired_at
-                        self._dialectic_empty_streak = 0
-                    else:
-                        self._dialectic_empty_streak += 1
+                    self._publish_query_result(r, _generation, _fired_at)
 
                 self._prefetch_thread_started_at = time.monotonic()
                 first_turn_thread = self._start_owned_worker(
@@ -1127,6 +1124,14 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Consume only results that are already ready; later turns never wait.
         dialectic_result = self._consume_pending_dialectic()
+        if not dialectic_result and self._turn_count <= 1:
+            with self._prefetch_lock:
+                if self._generic_prewarm_state == "ready":
+                    dialectic_result = self._generic_prewarm_result
+                    self._generic_prewarm_result = ""
+        elif dialectic_result and self._turn_count <= 1:
+            with self._prefetch_lock:
+                self._generic_prewarm_result = ""
 
         if dialectic_result and dialectic_result.strip():
             parts.append(dialectic_result)
@@ -1248,22 +1253,18 @@ class HonchoMemoryProvider(MemoryProvider):
         # Cadence advances only on a non-empty result so empty returns
         # (transient API error, sparse representation) retry next turn.
         _fired_at = self._turn_count
+        with self._prefetch_lock:
+            self._dialectic_generation += 1
+            _generation = self._dialectic_generation
 
         def _run():
             try:
                 result = self._run_dialectic_depth(query)
             except Exception as e:
                 logger.debug("Honcho prefetch failed: %s", e)
-                self._note_dialectic_failure(e)
+                self._note_dialectic_failure(e, generation=_generation)
                 return
-            if result and result.strip():
-                with self._prefetch_lock:
-                    self._prefetch_result = result
-                    self._prefetch_result_fired_at = _fired_at
-                self._last_dialectic_turn = _fired_at
-                self._dialectic_empty_streak = 0
-            else:
-                self._dialectic_empty_streak += 1
+            self._publish_query_result(result, _generation, _fired_at)
 
         self._prefetch_thread_started_at = time.monotonic()
         prefetch_thread = self._start_owned_worker(_run, name="honcho-prefetch")
@@ -1333,20 +1334,40 @@ class HonchoMemoryProvider(MemoryProvider):
         ceiling = self._dialectic_cadence * self._BACKOFF_MAX
         return min(widened, ceiling)
 
-    def _note_dialectic_failure(self, exc: BaseException) -> None:
+    def _note_dialectic_failure(
+        self, exc: BaseException, *, generation: Optional[int] = None
+    ) -> None:
         """Widen the empty-streak backoff after a failed dialectic cycle.
 
         Auth failures are exempt because waiting cannot fix a dead token.
         """
         from plugins.memory.honcho.session import HonchoAuthError
 
+        with self._prefetch_lock:
+            if generation is not None and generation != self._dialectic_generation:
+                return
         if isinstance(exc, HonchoAuthError):
             logger.warning(
                 "Honcho dialectic auth failure (not counted toward cadence backoff): %s",
                 exc,
             )
             return
-        self._dialectic_empty_streak += 1
+        with self._prefetch_lock:
+            if generation is None or generation == self._dialectic_generation:
+                self._dialectic_empty_streak += 1
+
+    def _publish_query_result(self, result: str, generation: int, fired_at: int) -> None:
+        """Publish only a result belonging to the current query generation."""
+        with self._prefetch_lock:
+            if generation != self._dialectic_generation:
+                return
+            if result and result.strip():
+                self._prefetch_result = result
+                self._prefetch_result_fired_at = fired_at
+                self._last_dialectic_turn = fired_at
+                self._dialectic_empty_streak = 0
+            else:
+                self._dialectic_empty_streak += 1
 
     def liveness_snapshot(self) -> dict:
         """In-process snapshot of dialectic liveness state for diagnostics.
@@ -1835,6 +1856,12 @@ class HonchoMemoryProvider(MemoryProvider):
                     return tool_error("Missing required parameter: query")
                 peer = args.get("peer", "user")
                 reasoning_level = args.get("reasoning_level")
+                with self._prefetch_lock:
+                    self._dialectic_generation += 1
+                    _tool_generation = self._dialectic_generation
+                    self._prefetch_result = ""
+                    self._generic_prewarm_result = ""
+                    self._generic_prewarm_generation += 1
                 try:
                     result = self._manager.dialectic_query(
                         self._session_key, query,
@@ -1861,7 +1888,9 @@ class HonchoMemoryProvider(MemoryProvider):
                         "'timeout' value in honcho.json."
                     )
                 # Update cadence tracker so auto-injection respects the gap after an explicit call
-                self._last_dialectic_turn = self._turn_count
+                with self._prefetch_lock:
+                    if _tool_generation == self._dialectic_generation:
+                        self._last_dialectic_turn = self._turn_count
                 return json.dumps({"result": result or "No result from Honcho."})
 
             elif tool_name == "honcho_context":
