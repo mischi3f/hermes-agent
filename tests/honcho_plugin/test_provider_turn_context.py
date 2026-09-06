@@ -1,6 +1,7 @@
 """Provider turn-context invariants."""
 
 import dataclasses
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -234,6 +235,51 @@ def test_ledger_tracks_transport_attempts_independently_of_wrapper_budget():
     assert ledger.consume("third") is True
     assert ledger.consume("overflow") is False
     assert ledger.wrapper_invocations == 4
+
+
+def test_ledger_reservation_atomically_protects_wrapper_and_transport_capacity():
+    ledger = OperationLedger(8)
+
+    reservation = ledger.reserve(wrapper_cap=2, transport_cap=2)
+    assert reservation is not None
+    assert ledger.unreserved_capacity == (6, 6)
+
+    barrier = threading.Barrier(2)
+    base_results: list[tuple[bool, bool]] = []
+    dialectic_results: list[tuple[bool, bool]] = []
+
+    def run_base() -> None:
+        barrier.wait()
+        for index in range(7):
+            wrapper = ledger.consume(f"base-{index}")
+            transport = ledger.charge_transport() if wrapper else False
+            base_results.append((wrapper, transport))
+
+    def run_dialectic() -> None:
+        with ledger.reservation_bound(reservation):
+            barrier.wait()
+            for category in ("dialectic query", "auth_retry"):
+                dialectic_results.append(
+                    (ledger.consume(category), ledger.charge_transport())
+                )
+
+    base_thread = threading.Thread(target=run_base)
+    dialectic_thread = threading.Thread(target=run_dialectic)
+    base_thread.start()
+    dialectic_thread.start()
+    base_thread.join(timeout=1)
+    dialectic_thread.join(timeout=1)
+
+    assert not base_thread.is_alive()
+    assert not dialectic_thread.is_alive()
+    assert base_results.count((True, True)) == 6
+    assert base_results[-1] == (False, False)
+    assert dialectic_results == [(True, True), (True, True)]
+
+    ledger.release(reservation)
+    assert ledger.remaining == 0
+    assert ledger.transport_remaining == 0
+    assert ledger.unreserved_capacity == (0, 0)
 
 
 def test_context_rejects_scope_and_expired_operations():

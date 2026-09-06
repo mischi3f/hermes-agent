@@ -2171,15 +2171,33 @@ class HonchoSessionManager:
         except Exception as e:
             logger.warning("Failed to fetch user context from Honcho: %s", e)
 
-        # Also fetch AI peer's own representation so Hermes knows itself.
-        try:
-            ai_ctx = self._fetch_peer_context(session, session.assistant_peer_id, target=session.assistant_peer_id, context=context)
-            result["ai_representation"] = ai_ctx["representation"]
-            result["ai_card"] = "\n".join(ai_ctx["card"])
-        except HonchoAuthError:
-            return result
-        except Exception as e:
-            logger.debug("Failed to fetch AI peer context from Honcho: %s", e)
+        # AI self-context is optional. Its peer-context fallback can require three
+        # calls (context, representation, card). Query dialectic capacity is held
+        # atomically on the same ledger, so this fallback may use only capacity
+        # that remains unreserved on both accounting axes.
+        if isinstance(context, ProviderTurnContext):
+            unreserved_wrappers, unreserved_transports = (
+                context.ledger.unreserved_capacity
+            )
+            has_ai_context_budget = (
+                unreserved_wrappers >= 3 and unreserved_transports >= 3
+            )
+        else:
+            has_ai_context_budget = True
+        if has_ai_context_budget:
+            try:
+                ai_ctx = self._fetch_peer_context(
+                    session,
+                    session.assistant_peer_id,
+                    target=session.assistant_peer_id,
+                    context=context,
+                )
+                result["ai_representation"] = ai_ctx["representation"]
+                result["ai_card"] = "\n".join(ai_ctx["card"])
+            except HonchoAuthError:
+                return result
+            except Exception as e:
+                logger.debug("Failed to fetch AI peer context from Honcho: %s", e)
 
         return result
 

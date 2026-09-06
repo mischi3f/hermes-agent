@@ -30,6 +30,37 @@ class _ControlledWorker:
         return not self._finished
 
 
+class _VirtualClock:
+    def __init__(self):
+        self.now = 100.0
+
+    def monotonic(self):
+        return self.now
+
+
+class _DelayedVirtualWorker:
+    """Joinable worker that completes after a fixed virtual delay."""
+
+    def __init__(self, target, *, clock, delay):
+        self._target = target
+        self._clock = clock
+        self._ready_at = clock.monotonic() + delay
+        self._finished = False
+
+    def join(self, timeout=None):
+        if self._finished or timeout is None:
+            return
+        self._clock.now = min(
+            self._ready_at, self._clock.monotonic() + max(0.0, timeout)
+        )
+        if self._clock.monotonic() >= self._ready_at:
+            self._target()
+            self._finished = True
+
+    def is_alive(self):
+        return not self._finished
+
+
 def _cold_resumed_provider(
     *, deadline_seconds: float = 5.0, monotonic=time.monotonic
 ):
@@ -118,6 +149,69 @@ def test_cold_resumed_base_wait_is_capped_by_turn_deadline(monkeypatch):
 
     assert provider.prefetch("Retrieve bounded context") == ""
     assert 0 < workers[0].join_timeout <= 0.05
+
+
+def test_cold_resumed_dialectic_uses_existing_combined_startup_window(monkeypatch):
+    """Slow query recall overlaps base work without increasing either wait cap."""
+    import plugins.memory.honcho as honcho_module
+
+    clock = _VirtualClock()
+    provider, manager = _cold_resumed_provider(
+        deadline_seconds=10.0, monotonic=clock.monotonic
+    )
+    provider._last_dialectic_turn = -999
+    provider._FIRST_TURN_BASE_TIMEOUT = 3.0
+    provider._FIRST_TURN_DIALECTIC_CAP = 2.0
+    provider._config.context_tokens = 3000
+    provider._config.dialectic_reasoning_level = "low"
+    manager.dialectic_query.return_value = (
+        "Pinewood Athletic Complex; insufficient shaded spectator seating."
+    )
+    starts = []
+
+    def start_worker(target, *, name):
+        starts.append((name, clock.monotonic()))
+        delay = 4.0 if name == "honcho-prefetch-first" else 3.0
+        return _DelayedVirtualWorker(target, clock=clock, delay=delay)
+
+    monkeypatch.setattr(provider, "_start_owned_worker", start_worker)
+    monkeypatch.setattr(honcho_module.time, "monotonic", clock.monotonic)
+
+    result = provider.prefetch("Which facility and concern did we discuss?")
+
+    assert starts[0] == ("honcho-prefetch-first", 100.0)
+    assert starts[1] == ("honcho-base-first", 100.0)
+    assert clock.monotonic() <= 105.0
+    assert manager.dialectic_query.call_count == 1
+    assert provider._last_dialectic_turn == 3
+    assert "Pinewood Athletic Complex" in result
+    assert "insufficient shaded spectator seating" in result
+
+
+def test_cold_resumed_dialectic_fails_closed_when_capacity_cannot_be_reserved(
+    monkeypatch,
+):
+    provider, manager = _cold_resumed_provider(deadline_seconds=10)
+    provider._last_dialectic_turn = -999
+    provider._config.context_tokens = 3000
+    provider._config.dialectic_reasoning_level = "low"
+    for index in range(8):
+        assert provider._turn_context.consume(f"prior-{index}") is True
+        assert provider._turn_context.ledger.charge_transport() is True
+
+    starts = []
+
+    def start_worker(target, name):
+        starts.append(name)
+        return _ControlledWorker(target)
+
+    monkeypatch.setattr(provider, "_start_owned_worker", start_worker)
+
+    result = provider.prefetch("What did we discuss about Pinewood?")
+
+    assert manager.dialectic_query.call_count == 0
+    assert "honcho-prefetch-first" in starts
+    assert "Pinewood Athletic Complex" in result
 
 
 def test_warm_later_turn_does_not_start_synchronous_base_worker(monkeypatch):

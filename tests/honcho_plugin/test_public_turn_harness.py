@@ -59,6 +59,7 @@ class PublicTurnTransport:
         direct_records: list[dict] | None = None,
         user_representation: str = GENERATED,
         chat_content: str = GENERATED,
+        empty_peer_context: bool = False,
         workspace_response: str = WORKSPACE,
         scoped_error: BaseException | None = None,
         auth_rotate_path: Path | None = None,
@@ -67,6 +68,7 @@ class PublicTurnTransport:
         self.direct_records = direct_records
         self.user_representation = user_representation
         self.chat_content = chat_content
+        self.empty_peer_context = empty_peer_context
         self.workspace_response = workspace_response
         self.scoped_error = scoped_error
         self.auth_rotate_path = auth_rotate_path
@@ -151,9 +153,13 @@ class PublicTurnTransport:
                 "peer_id": observer,
                 "target_id": target,
                 "representation": (
-                    self.user_representation if target == USER else "Hermes assistant memory."
+                    None
+                    if self.empty_peer_context
+                    else self.user_representation
+                    if target == USER
+                    else "Hermes assistant memory."
                 ),
-                "peer_card": [],
+                "peer_card": None if self.empty_peer_context else [],
             }
         elif path.endswith("/chat"):
             payload = {"content": self.chat_content}
@@ -388,6 +394,43 @@ def test_public_turn_path_injects_pinewood_context_with_one_shared_authority(tmp
         assert authority.workspace == WORKSPACE
         assert authority.session == SESSION
         assert authority.permitted_peers == frozenset({USER, ASSISTANT})
+    finally:
+        harness.close()
+
+
+def test_public_turn_base_fallbacks_do_not_starve_query_dialectic(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HONCHO_SAVE_MESSAGES", "false")
+    transport = PublicTurnTransport(empty_peer_context=True)
+    harness = _start_harness(tmp_path, monkeypatch, transport=transport)
+    try:
+        result = harness.turn()
+        authority = harness.provider._turn_context
+        scoped_calls = [
+            call for call in transport.calls if call["context"] is authority
+        ]
+        scoped_chats = [
+            call for call in scoped_calls if str(call["path"]).endswith("/chat")
+        ]
+
+        assert result["completed"] is True
+        assert isinstance(authority, ProviderTurnContext)
+        assert len(scoped_calls) <= 8
+        assert not authority.expired
+        assert len(scoped_chats) == 1, [
+            (call["method"], call["path"]) for call in scoped_calls
+        ]
+        assert QUERY in json.dumps(scoped_chats[0]["body"])
+        final_model_context = harness.final_user_content()
+        assert GENERATED in final_model_context
+        assert "Pinewood Athletic Complex" in final_model_context
+        assert "insufficient shaded spectator seating" in final_model_context
+        assert harness.manager.get_all_tool_schemas() == []
+        assert not any(
+            call["method"] == "POST" and str(call["path"]).endswith("/messages")
+            for call in transport.calls
+        )
     finally:
         harness.close()
 
@@ -733,7 +776,12 @@ def test_public_auth_retry_keeps_one_authority_deadline_and_transport_ledger(
     tmp_path, monkeypatch
 ):
     transport = PublicTurnTransport()
-    harness = _start_harness(tmp_path, monkeypatch, transport=transport)
+    harness = _start_harness(
+        tmp_path,
+        monkeypatch,
+        transport=transport,
+        config_overrides={"contextCadence": 999},
+    )
     config_path = tmp_path / "honcho.json"
     oauth_config = {
         "hosts": {

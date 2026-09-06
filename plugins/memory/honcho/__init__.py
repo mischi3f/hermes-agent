@@ -1110,6 +1110,96 @@ class HonchoMemoryProvider(MemoryProvider):
         parts = []
         base_context = ""
 
+        # Start the first query-specific dialectic before the cold base fetch.
+        # Both workers retain their existing independent join caps below, but
+        # their I/O may now overlap inside the same absolute turn deadline.
+        # This matters for process-per-turn callers: unfinished work cannot be
+        # surfaced by the next turn because the provider instance will exit.
+        _dia_wait = 0.0
+        if self._last_dialectic_turn == -999 and query:
+            _dia_wait = self._FIRST_TURN_DIALECTIC_CAP
+            request_timeout = getattr(self._config, "timeout", None)
+            if request_timeout is not None:
+                _dia_wait = min(_dia_wait, max(0.0, request_timeout))
+            if not self._thread_is_live():
+                _fired_at = self._turn_count
+                dialectic_turn_context = self._turn_context
+                with self._prefetch_lock:
+                    self._dialectic_generation += 1
+                    _generation = self._dialectic_generation
+
+                # Hold capacity on the existing shared turn ledger before the
+                # base worker can spend it. Two slots per configured pass cover
+                # the initial request plus one bounded authentication retry.
+                # Unused capacity is released as soon as all passes end.
+                _dialectic_reservation = None
+                if dialectic_turn_context is not None:
+                    (
+                        _available_wrappers,
+                        _available_transports,
+                    ) = dialectic_turn_context.ledger.unreserved_capacity
+                    _reservation_cap = min(
+                        2 * max(1, self._dialectic_depth),
+                        _available_wrappers,
+                        _available_transports,
+                    )
+                    if _reservation_cap >= max(1, self._dialectic_depth):
+                        _dialectic_reservation = (
+                            dialectic_turn_context.ledger.reserve(
+                                wrapper_cap=_reservation_cap,
+                                transport_cap=_reservation_cap,
+                            )
+                        )
+
+                if (
+                    dialectic_turn_context is not None
+                    and _dialectic_reservation is None
+                ):
+                    logger.debug(
+                        "Honcho query dialectic skipped: turn capacity reservation unavailable"
+                    )
+
+                def _run_first_turn() -> None:
+                    try:
+                        if (
+                            dialectic_turn_context is not None
+                            and _dialectic_reservation is not None
+                        ):
+                            with dialectic_turn_context.ledger.reservation_bound(
+                                _dialectic_reservation
+                            ):
+                                r = self._run_dialectic_depth(
+                                    query, context=dialectic_turn_context
+                                )
+                        elif dialectic_turn_context is None:
+                            r = self._run_dialectic_depth(query)
+                        else:
+                            return
+                    except Exception as exc:
+                        logger.debug("Honcho first-turn dialectic failed: %s", exc)
+                        self._note_dialectic_failure(exc, generation=_generation)
+                        return
+                    finally:
+                        if (
+                            dialectic_turn_context is not None
+                            and _dialectic_reservation is not None
+                        ):
+                            dialectic_turn_context.ledger.release(
+                                _dialectic_reservation
+                            )
+                    self._publish_query_result(r, _generation, _fired_at)
+
+                self._prefetch_thread_started_at = time.monotonic()
+                self._prefetch_thread = self._start_owned_worker(
+                    _run_first_turn, name="honcho-prefetch-first"
+                )
+                if (
+                    self._prefetch_thread is None
+                    and dialectic_turn_context is not None
+                    and _dialectic_reservation is not None
+                ):
+                    dialectic_turn_context.ledger.release(_dialectic_reservation)
+
         # One-time notice, relayed by the model, that auth is dead and memory is paused.
         auth_notice = self._pop_auth_notice()
         if auth_notice:
@@ -1222,45 +1312,12 @@ class HonchoMemoryProvider(MemoryProvider):
                 parts.append(base_context)
 
         # ----- Layer 2: Dialectic supplement -----
-        # Turn 1 may briefly wait for dialectic; unfinished work remains async.
+        # The dialectic worker started before Layer 1 so it can use time spent
+        # waiting for base context. Its own join cap is unchanged.
         if self._last_dialectic_turn == -999 and query:
-            # Reuse an in-flight prewarm; otherwise start one dialectic. A short
-            # request timeout may tighten, but never expand, the turn-1 wait.
-            _dia_wait = self._FIRST_TURN_DIALECTIC_CAP
-            request_timeout = getattr(self._config, "timeout", None)
-            if request_timeout is not None:
-                _dia_wait = min(_dia_wait, max(0.0, request_timeout))
-            if self._thread_is_live():
-                _live = self._prefetch_thread
-                if _live is not None:
-                    _live.join(timeout=_dia_wait)
-            else:
-                _first_turn_timeout = _dia_wait
-                _fired_at = self._turn_count
-                turn_context = self._turn_context
-                with self._prefetch_lock:
-                    self._dialectic_generation += 1
-                    _generation = self._dialectic_generation
-
-                def _run_first_turn() -> None:
-                    try:
-                        if turn_context is None:
-                            r = self._run_dialectic_depth(query)
-                        else:
-                            r = self._run_dialectic_depth(query, context=turn_context)
-                    except Exception as exc:
-                        logger.debug("Honcho first-turn dialectic failed: %s", exc)
-                        self._note_dialectic_failure(exc, generation=_generation)
-                        return
-                    self._publish_query_result(r, _generation, _fired_at)
-
-                self._prefetch_thread_started_at = time.monotonic()
-                first_turn_thread = self._start_owned_worker(
-                    _run_first_turn, name="honcho-prefetch-first"
-                )
-                self._prefetch_thread = first_turn_thread
-                if self._prefetch_thread is not None:
-                    self._prefetch_thread.join(timeout=_first_turn_timeout)
+            _live = self._prefetch_thread
+            if _live is not None:
+                _live.join(timeout=_dia_wait)
             if self._prefetch_thread and self._prefetch_thread.is_alive():
                 logger.debug(
                     "Honcho first-turn dialectic still running after %.1fs — "
@@ -1670,8 +1727,8 @@ class HonchoMemoryProvider(MemoryProvider):
     ) -> str:
         """Execute up to dialecticDepth .chat() calls with conditional bail-out.
 
-        Cold start (no base context): general user-oriented query.
-        Warm session (base context exists): session-scoped query.
+        Pass 0 uses the current bounded query (or its configured rewrite).
+        Later passes synthesize or reconcile the preceding result.
         Each pass is conditional — bails early if prior pass returned strong signal.
         Returns the best (usually last) result.
         """
@@ -1693,9 +1750,16 @@ class HonchoMemoryProvider(MemoryProvider):
             # Dependent prompts require a non-empty prior result.
             prior_results = [r for r in results if r and r.strip()]
             if i == 0:
-                prompt = rewritten_query or self._build_dialectic_prompt(
-                    0, prior_results, is_cold
-                )
+                if rewritten_query:
+                    prompt = rewritten_query
+                elif isinstance(context, ProviderTurnContext):
+                    # A live user-turn query is already bounded by
+                    # dialectic_query. Keep it query-specific when rewriting is
+                    # disabled; generic operation/prewarm contexts retain the
+                    # established profile prompt below.
+                    prompt = query
+                else:
+                    prompt = self._build_dialectic_prompt(i, prior_results, is_cold)
             else:
                 # Skip further passes if prior pass delivered strong signal
                 if prior_results and self._signal_sufficient(prior_results[-1]):
@@ -1706,9 +1770,10 @@ class HonchoMemoryProvider(MemoryProvider):
                     # Retry the independent base prompt after empty passes.
                     logger.debug("Honcho dialectic depth %d: pass %d has no non-empty prior — "
                                  "falling back to base prompt", self._dialectic_depth, i)
-                    prompt = rewritten_query or self._build_dialectic_prompt(
-                        0, prior_results, is_cold
-                    )
+                    if rewritten_query or isinstance(context, ProviderTurnContext):
+                        prompt = rewritten_query or query
+                    else:
+                        prompt = self._build_dialectic_prompt(0, [], is_cold)
                 else:
                     prompt = self._build_dialectic_prompt(i, prior_results, is_cold)
 

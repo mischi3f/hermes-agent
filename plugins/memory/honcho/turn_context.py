@@ -430,6 +430,8 @@ class OperationLedger:
         self._transport_attempts = 0
         self._wrapper_invocations = 0
         self._counts: dict[str, int] = {}
+        self._reservations: dict[object, list[int]] = {}
+        self._reservation_binding = threading.local()
         self._lock = threading.Lock()
 
     def consume(self, category: str) -> bool:
@@ -445,6 +447,14 @@ class OperationLedger:
             self._counts[category] = self._counts.get(category, 0) + 1
             if self._remaining <= 0:
                 return False
+            token = getattr(self._reservation_binding, "token", None)
+            reservation = self._reservations.get(token)
+            if reservation is not None and reservation[0] > 0:
+                reservation[0] -= 1
+            else:
+                held = sum(item[0] for item in self._reservations.values())
+                if self._remaining <= held:
+                    return False
             self._remaining -= 1
             return True
 
@@ -453,9 +463,49 @@ class OperationLedger:
         with self._lock:
             if self._transport_remaining <= 0:
                 return False
+            token = getattr(self._reservation_binding, "token", None)
+            reservation = self._reservations.get(token)
+            if reservation is not None and reservation[1] > 0:
+                reservation[1] -= 1
+            else:
+                held = sum(item[1] for item in self._reservations.values())
+                if self._transport_remaining <= held:
+                    return False
             self._transport_remaining -= 1
             self._transport_attempts += 1
             return True
+
+    def reserve(self, *, wrapper_cap: int, transport_cap: int) -> object | None:
+        """Atomically hold existing wrapper and transport capacity for one worker."""
+        wrapper_cap = max(0, int(wrapper_cap))
+        transport_cap = max(0, int(transport_cap))
+        if wrapper_cap == 0 and transport_cap == 0:
+            return None
+        with self._lock:
+            held_wrappers = sum(item[0] for item in self._reservations.values())
+            held_transports = sum(item[1] for item in self._reservations.values())
+            if wrapper_cap > self._remaining - held_wrappers:
+                return None
+            if transport_cap > self._transport_remaining - held_transports:
+                return None
+            token = object()
+            self._reservations[token] = [wrapper_cap, transport_cap]
+            return token
+
+    @contextlib.contextmanager
+    def reservation_bound(self, token: object):
+        """Let this thread consume capacity atomically held by ``token``."""
+        previous = getattr(self._reservation_binding, "token", None)
+        self._reservation_binding.token = token
+        try:
+            yield
+        finally:
+            self._reservation_binding.token = previous
+
+    def release(self, token: object) -> None:
+        """Release any unused capacity held by ``token``."""
+        with self._lock:
+            self._reservations.pop(token, None)
 
     @property
     def remaining(self) -> int:
@@ -466,6 +516,17 @@ class OperationLedger:
     def transport_remaining(self) -> int:
         with self._lock:
             return self._transport_remaining
+
+    @property
+    def unreserved_capacity(self) -> tuple[int, int]:
+        """Return both unreserved accounting axes from one atomic snapshot."""
+        with self._lock:
+            held_wrappers = sum(item[0] for item in self._reservations.values())
+            held_transports = sum(item[1] for item in self._reservations.values())
+            return (
+                max(0, self._remaining - held_wrappers),
+                max(0, self._transport_remaining - held_transports),
+            )
 
     @property
     def transport_attempts(self) -> int:
