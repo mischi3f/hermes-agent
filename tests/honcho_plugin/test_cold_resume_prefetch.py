@@ -45,9 +45,11 @@ class _DelayedVirtualWorker:
         self._target = target
         self._clock = clock
         self._ready_at = clock.monotonic() + delay
+        self.join_timeout = None
         self._finished = False
 
     def join(self, timeout=None):
+        self.join_timeout = timeout
         if self._finished or timeout is None:
             return
         self._clock.now = min(
@@ -98,6 +100,100 @@ def _cold_resumed_provider(
         monotonic=monotonic,
     )
     return provider, manager
+
+
+def test_resumed_turn_derives_authority_before_async_session_cache_ready():
+    provider = HonchoMemoryProvider()
+    manager = MagicMock()
+    manager._cache = {}
+    manager._resolve_user_peer_id.return_value = "user-synthetic"
+    manager._sanitize_id.side_effect = lambda value: value
+    provider._manager = manager
+    provider._config = SimpleNamespace(
+        ai_peer="assistant-synthetic",
+        timeout=10.0,
+        workspace_id="workspace-synthetic",
+    )
+    provider._session_key = "session-synthetic"
+
+    provider.on_turn_start(3, "Which facility did we discuss?")
+
+    context = provider._turn_context
+    assert context is not None
+    assert context.turn == 3
+    assert context.workspace == "workspace-synthetic"
+    assert context.session == "session-synthetic"
+    assert context.user_peer == "user-synthetic"
+    assert context.ai_peer == "assistant-synthetic"
+
+
+def test_cold_resumed_prefetch_shares_one_deadline_across_init_and_base(
+    monkeypatch,
+):
+    import plugins.memory.honcho as honcho_module
+
+    clock = _VirtualClock()
+    session = HonchoSession(
+        key="session-synthetic",
+        user_peer_id="user-synthetic",
+        assistant_peer_id="assistant-synthetic",
+        honcho_session_id="session-synthetic",
+    )
+    provider = HonchoMemoryProvider()
+    manager = MagicMock()
+    manager._cache = {}
+    manager._resolve_user_peer_id.return_value = session.user_peer_id
+    manager._sanitize_id.side_effect = lambda value: value
+    manager.get_prefetch_context.return_value = {
+        "representation": (
+            "Pinewood Athletic Complex has insufficient shaded spectator seating."
+        ),
+        "card": "",
+    }
+    provider._manager = manager
+    provider._config = SimpleNamespace(
+        ai_peer=session.assistant_peer_id,
+        context_tokens=0,
+        timeout=10.0,
+        workspace_id="workspace-synthetic",
+    )
+    provider._session_key = session.key
+    provider._session_initialized = False
+    provider._recall_mode = "context"
+    provider._last_dialectic_turn = 3
+    provider._base_context_cache = None
+    provider._FIRST_TURN_BASE_TIMEOUT = 0.5
+
+    def finish_init():
+        manager._cache[session.key] = session
+        provider._session_initialized = True
+
+    provider._init_thread = _DelayedVirtualWorker(
+        finish_init,
+        clock=clock,
+        delay=0.2,
+    )
+    started = []
+
+    def start_worker(target, *, name):
+        worker = _DelayedVirtualWorker(target, clock=clock, delay=0.2)
+        started.append((name, worker))
+        return worker
+
+    monkeypatch.setattr(provider, "_start_owned_worker", start_worker)
+    monkeypatch.setattr(provider, "_start_session_init_background", lambda: None)
+    monkeypatch.setattr(honcho_module.time, "monotonic", clock.monotonic)
+
+    provider.on_turn_start(3, "Which facility did we discuss?")
+    result = provider.prefetch("Which facility did we discuss?")
+
+    assert provider._turn_context is not None
+    assert provider._init_thread.join_timeout <= 0.5
+    assert started[0][0] == "honcho-base-first"
+    assert started[0][1].join_timeout <= 0.3
+    assert clock.monotonic() <= 100.5
+    assert "Pinewood Athletic Complex" in result
+    assert "insufficient shaded spectator seating" in result
 
 
 def test_new_provider_resuming_later_turn_waits_for_first_cold_base_fetch(monkeypatch):

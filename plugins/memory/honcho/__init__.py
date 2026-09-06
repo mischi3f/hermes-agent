@@ -1076,22 +1076,32 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._recall_mode == "tools":
             return ""
 
-        first_turn_base_deadline = None
-        if self._turn_count <= 1:
+        cold_start_deadline = None
+        if (
+            self._turn_count <= 1
+            or self._base_context_cache is None
+            or not self._session_ready()
+        ):
             base_wait = self._FIRST_TURN_BASE_TIMEOUT
             request_timeout = getattr(self._config, "timeout", None)
             if request_timeout is not None:
                 base_wait = min(base_wait, max(0.0, request_timeout))
-            first_turn_base_deadline = time.monotonic() + max(0.0, base_wait)
+            cold_start_deadline = time.monotonic() + max(0.0, base_wait)
+            if self._turn_context is not None:
+                cold_start_deadline = min(
+                    cold_start_deadline, self._turn_context.deadline
+                )
 
         if not self._session_ready():
-            # Only turn 1 may wait for session init; later turns fail open.
+            # A cold provider may resume any conversational turn. Spend the
+            # same bounded startup deadline on remote session init first, then
+            # give only its remainder to the initial base fetch below.
             self._start_session_init_background()
-            if first_turn_base_deadline is not None:
+            if cold_start_deadline is not None:
                 _init_thread = self._init_thread
                 if _init_thread is not None:
                     _init_thread.join(
-                        timeout=max(0.0, first_turn_base_deadline - time.monotonic())
+                        timeout=max(0.0, cold_start_deadline - time.monotonic())
                     )
             if not self._session_ready():
                 # A failed auth init still owes the user the one-time notice.
@@ -1220,11 +1230,9 @@ class HonchoMemoryProvider(MemoryProvider):
                 _ctx_holder: dict[str, dict] = {}
                 turn_context = self._turn_context
 
-                # A cold provider instance needs one bounded startup wait even
-                # when it resumes a later conversational turn. Keep turn 1's
-                # existing shared init/base deadline; process-per-turn callers
-                # get a fresh deadline only for this first local cache fill.
-                base_fetch_deadline = first_turn_base_deadline
+                # Session init and the first local base cache fill share one
+                # cold-start deadline on every conversational turn.
+                base_fetch_deadline = cold_start_deadline
                 if base_fetch_deadline is None:
                     base_wait = self._FIRST_TURN_BASE_TIMEOUT
                     request_timeout = getattr(self._config, "timeout", None)
@@ -1814,13 +1822,27 @@ class HonchoMemoryProvider(MemoryProvider):
         session = None
         if self._manager and self._session_key:
             session = getattr(self._manager, "_cache", {}).get(self._session_key)
-        session_id = kwargs.get("session_id") or getattr(session, "honcho_session_id", "")
+        session_id = getattr(session, "honcho_session_id", "")
+        user_peer = getattr(session, "user_peer_id", "")
+        ai_peer = getattr(session, "assistant_peer_id", "")
+        if session is None and self._manager and self._session_key and self._config:
+            # Session initialization is asynchronous in context/hybrid mode. Its
+            # remote get-or-create may still be running when a resumed turn
+            # starts, but these are the same deterministic identities that
+            # _do_session_init derives before touching the backend.
+            try:
+                session_id = self._manager._sanitize_id(self._session_key)
+                user_peer = self._manager._resolve_user_peer_id(self._session_key)
+                ai_peer = self._manager._sanitize_id(self._config.ai_peer)
+            except (AttributeError, TypeError, ValueError):
+                session_id = ""
+                user_peer = ""
+                ai_peer = ""
+        session_id = kwargs.get("session_id") or session_id
         workspace = getattr(self._config, "workspace_id", "") if self._config else ""
         if not all(
             isinstance(value, str) and value.strip()
-            for value in (workspace, session_id,
-                          getattr(session, "user_peer_id", None),
-                          getattr(session, "assistant_peer_id", None))
+            for value in (workspace, session_id, user_peer, ai_peer)
         ):
             self._turn_context = None
             return
@@ -1831,8 +1853,8 @@ class HonchoMemoryProvider(MemoryProvider):
             generation=self._turn_generation,
             workspace=workspace,
             session=session_id,
-            user_peer=session.user_peer_id,
-            ai_peer=session.assistant_peer_id,
+            user_peer=user_peer,
+            ai_peer=ai_peer,
             deadline=time.monotonic() + timeout,
             total_cap=8,
         )
