@@ -1130,6 +1130,22 @@ class HonchoMemoryProvider(MemoryProvider):
                 _ctx_holder: dict[str, dict] = {}
                 turn_context = self._turn_context
 
+                # A cold provider instance needs one bounded startup wait even
+                # when it resumes a later conversational turn. Keep turn 1's
+                # existing shared init/base deadline; process-per-turn callers
+                # get a fresh deadline only for this first local cache fill.
+                base_fetch_deadline = first_turn_base_deadline
+                if base_fetch_deadline is None:
+                    base_wait = self._FIRST_TURN_BASE_TIMEOUT
+                    request_timeout = getattr(self._config, "timeout", None)
+                    if request_timeout is not None:
+                        base_wait = min(base_wait, max(0.0, request_timeout))
+                    base_fetch_deadline = time.monotonic() + max(0.0, base_wait)
+                if turn_context is not None:
+                    base_fetch_deadline = min(
+                        base_fetch_deadline, turn_context.deadline
+                    )
+
                 def _fetch_base() -> None:
                     try:
                         if turn_context is None:
@@ -1157,11 +1173,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
                 _bt = self._start_owned_worker(_fetch_base, name="honcho-base-first")
                 self._base_thread = _bt
-                _base_wait = (
-                    max(0.0, first_turn_base_deadline - time.monotonic())
-                    if first_turn_base_deadline is not None
-                    else 0.0
-                )
+                _base_wait = max(0.0, base_fetch_deadline - time.monotonic())
                 if _bt is not None:
                     _bt.join(timeout=_base_wait)
                 _ctx = _ctx_holder.get("ctx")

@@ -240,10 +240,11 @@ class CaptureModelClient:
         return None
 
 
-def _run_public_turn(host, query: str):
+def _run_public_turn(host, query: str, *, conversation_history=None):
     return run_conversation(
         host,
         query,
+        conversation_history=conversation_history,
         task_id="task-public-harness",
     )
 
@@ -257,8 +258,11 @@ class PublicHarness:
     host: object
     model_client: CaptureModelClient
 
-    def turn(self, query: str = QUERY):
-        return _run_public_turn(self.host, query)
+    def turn(self, query: str = QUERY, *, conversation_history=None):
+        return _run_public_turn(
+            self.host, query,
+            conversation_history=conversation_history,
+        )
 
     def final_request(self, index: int = -1) -> dict:
         return self.model_client.model_requests[index]
@@ -629,6 +633,53 @@ def test_public_fresh_turn_replaces_authority_while_provider_recall_pool_remains
         assert DIRECT in second_context
     finally:
         harness.close()
+
+
+def test_public_cold_provider_resumes_later_turn_with_read_only_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HONCHO_SAVE_MESSAGES", "false")
+    transport = PublicTurnTransport()
+    first = _start_harness(
+        tmp_path,
+        monkeypatch,
+        transport=transport,
+        config_overrides={"saveMessages": True},
+    )
+    try:
+        assert first.turn()["completed"] is True
+    finally:
+        first.close()
+
+    resumed = _start_harness(
+        tmp_path,
+        monkeypatch,
+        transport=transport,
+        config_overrides={"saveMessages": True},
+    )
+    try:
+        assert resumed.provider._base_context_cache is None
+        result = resumed.turn(
+            "Please restate the tournament facility concern.",
+            conversation_history=[
+                {"role": "user", "content": "Synthetic earlier question."},
+                {"role": "assistant", "content": "Synthetic earlier answer."},
+            ],
+        )
+        if resumed.provider._sync_thread is not None:
+            resumed.provider._sync_thread.join(timeout=5)
+
+        assert result["completed"] is True
+        assert resumed.provider._turn_context.turn == 2
+        assert DIRECT in resumed.final_user_content()
+        assert resumed.manager.get_all_tool_schemas() == []
+        assert not any(
+            call["method"] == "POST"
+            and str(call["path"]).endswith("/messages")
+            for call in transport.calls
+        )
+    finally:
+        resumed.close()
 
 
 def test_public_model_tool_loop_conclusion_uses_scope_and_hides_provider_artifacts(

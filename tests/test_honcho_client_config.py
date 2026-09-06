@@ -183,6 +183,58 @@ class TestRecallModeResolution:
         assert cfg.timeout == 5.0
 
 
+class TestSaveMessagesResolution:
+    """Message persistence supports a narrow process-local override."""
+
+    @staticmethod
+    def _config(tmp_path, *, root=None, host=None):
+        data = {"apiKey": "synthetic-key"}
+        if root is not None:
+            data["saveMessages"] = root
+        if host is not None:
+            data["hosts"] = {"hermes": {"saveMessages": host}}
+        path = tmp_path / "honcho.json"
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_without_override_preserves_host_then_root_precedence(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("HONCHO_SAVE_MESSAGES", raising=False)
+        cfg = HonchoClientConfig.from_global_config(
+            config_path=self._config(tmp_path, root=True, host=False)
+        )
+        assert cfg.save_messages is False
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        (("false", False), ("0", False), ("true", True), ("1", True)),
+    )
+    def test_valid_process_override_wins(
+        self, tmp_path, monkeypatch, value, expected
+    ):
+        monkeypatch.setenv("HONCHO_SAVE_MESSAGES", value)
+        cfg = HonchoClientConfig.from_global_config(
+            config_path=self._config(tmp_path, root=not expected, host=not expected)
+        )
+        assert cfg.save_messages is expected
+
+    @pytest.mark.parametrize("value", ("", "unsupported"))
+    def test_empty_or_invalid_override_preserves_file_config(
+        self, tmp_path, monkeypatch, value
+    ):
+        monkeypatch.setenv("HONCHO_SAVE_MESSAGES", value)
+        cfg = HonchoClientConfig.from_global_config(
+            config_path=self._config(tmp_path, root=True, host=False)
+        )
+        assert cfg.save_messages is False
+
+    def test_from_env_honors_false_override(self, monkeypatch):
+        monkeypatch.setenv("HONCHO_API_KEY", "synthetic-key")
+        monkeypatch.setenv("HONCHO_SAVE_MESSAGES", "false")
+        assert HonchoClientConfig.from_env().save_messages is False
+
+
 class TestHonchoBaseUrlSanitize:
     def test_clean_base_url_accepted(self, tmp_path, monkeypatch):
         monkeypatch.delenv('HONCHO_BASE_URL', raising=False)

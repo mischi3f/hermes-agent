@@ -169,6 +169,20 @@ def _resolve_recall_mode(host_value: object, root_value: object) -> str:
     return _normalize_recall_mode(host_value or root_value or "hybrid")
 
 
+def _resolve_save_messages(host_value: object, root_value: object) -> bool:
+    """Resolve message persistence with an optional process-local override."""
+    override = os.environ.get("HONCHO_SAVE_MESSAGES", "").strip().lower()
+    if override:
+        if override in {"1", "true", "yes", "on"}:
+            return True
+        if override in {"0", "false", "no", "off"}:
+            return False
+        logger.warning(
+            "Ignoring invalid HONCHO_SAVE_MESSAGES value; using Honcho config"
+        )
+    return _resolve_bool(host_value, root_value, default=True)
+
+
 def _resolve_bool(*vals, default: bool) -> bool:
     """Resolve a bool config field: first non-None wins, else default.
 
@@ -748,6 +762,7 @@ class HonchoClientConfig:
             ai_peer=resolved_host,
             enabled=bool(api_key or base_url),
             recall_mode=_resolve_recall_mode(None, None),
+            save_messages=_resolve_save_messages(None, None),
             config_path=_resolved_path,
             hermes_home=get_hermes_home(),
         )
@@ -871,9 +886,10 @@ class HonchoClientConfig:
         except (TypeError, ValueError):
             write_frequency = str(raw_wf)
 
-        # saveMessages: host wins (None-aware since False is valid)
-        host_save = host_block.get("saveMessages")
-        save_messages = host_save if host_save is not None else raw.get("saveMessages", True)
+        # saveMessages: process override, then host, then root. False is valid.
+        save_messages = _resolve_save_messages(
+            host_block.get("saveMessages"), raw.get("saveMessages")
+        )
 
         # sessionStrategy / sessionPeerPrefix: host first, root fallback
         session_strategy = (
