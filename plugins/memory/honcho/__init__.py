@@ -16,6 +16,7 @@ Config: Uses the existing Honcho config chain:
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import re
 import threading
@@ -35,6 +36,12 @@ from plugins.memory.honcho.client import (
 from plugins.memory.honcho.context_selection import (
     assemble_context_layers,
     select_complete_context,
+)
+from plugins.memory.honcho.turn_context import (
+    ModelFacingRenderer,
+    ProviderOperationContext,
+    ProviderTurnContext,
+    renderer_for_context,
 )
 from tools.registry import tool_error
 
@@ -306,6 +313,7 @@ class HonchoMemoryProvider(MemoryProvider):
         self._prewarm_thread: Optional[threading.Thread] = None
         self._generic_prewarm_state = "not_started"
         self._generic_prewarm_result = ""
+        self._generic_prewarm_scope: tuple[str, str, str, str, int] | None = None
         self._generic_prewarm_generation = 0
         self._dialectic_generation = 0
         self._sync_thread: Optional[threading.Thread] = None
@@ -368,6 +376,9 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Cron and flush contexts disable the plugin entirely.
         self._cron_skipped = False
+        self._turn_context: Optional[ProviderTurnContext] = None
+        self._turn_generation = 0
+        self._active_turn_number: Optional[int] = None
 
     @property
     def name(self) -> str:
@@ -706,7 +717,15 @@ class HonchoMemoryProvider(MemoryProvider):
             if self._init_thread is not None and wait_timeout > 0:
                 self._init_thread.join(timeout=wait_timeout)
 
-    def _do_session_init(self, cfg, session_id: str, **kwargs) -> bool:
+    def _do_session_init(
+        self,
+        cfg,
+        session_id: str,
+        *,
+        context: Optional[ProviderTurnContext | ProviderOperationContext] = None,
+        turn_number: Optional[int] = None,
+        **kwargs,
+    ) -> bool:
         """Shared session initialization logic for both eager and lazy paths."""
         from plugins.memory.honcho.session import HonchoSessionManager
 
@@ -734,12 +753,36 @@ class HonchoMemoryProvider(MemoryProvider):
             session_key = self._resolve_session_key(cfg, session_id, **kwargs)
             logger.debug("Honcho session key resolved")
 
+            if context is None and turn_number is not None:
+                # Tools-only mode can initialize after on_turn_start. Derive the
+                # same immutable scope get_or_create will use, then carry this
+                # one turn authority through initialization and the tool call.
+                user_peer_id = manager._resolve_user_peer_id(session_key)
+                assistant_peer_id = manager._sanitize_id(cfg.ai_peer)
+                honcho_session_id = manager._sanitize_id(session_key)
+                self._turn_generation += 1
+                timeout = getattr(cfg, "timeout", None) or 30.0
+                context = ProviderTurnContext.create(
+                    turn=turn_number,
+                    generation=self._turn_generation,
+                    workspace=cfg.workspace_id,
+                    session=honcho_session_id,
+                    user_peer=user_peer_id,
+                    ai_peer=assistant_peer_id,
+                    deadline=time.monotonic() + timeout,
+                    total_cap=8,
+                )
+                self._turn_context = context
+
         # Create the remote session before running startup-only migration and
         # prewarm work. Do not mark the provider ready until this method's
         # synchronous setup has finished; background startup sets _manager before
         # get_or_create()/migration/prewarm are complete, and lifecycle hooks must
         # not treat that partially initialized state as usable.
-            session = manager.get_or_create(session_key)
+            session_context = context or manager._new_operation_context(
+                "startup initialization"
+            )
+            session = manager.get_or_create(session_key, context=session_context)
 
         # Skip under per-session strategy: every Hermes run creates a fresh
         # Honcho session by design, so uploading MEMORY.md/USER.md/SOUL.md to
@@ -749,7 +792,9 @@ class HonchoMemoryProvider(MemoryProvider):
                 if not session.messages and cfg.session_strategy != "per-session":
                     from hermes_constants import get_hermes_home
                     mem_dir = str(get_hermes_home() / "memories")
-                    manager.migrate_memory_files(session_key, mem_dir)
+                    manager.migrate_memory_files(
+                        session_key, mem_dir, context=session_context
+                    )
                     logger.debug("Honcho memory file migration attempted")
                 elif cfg.session_strategy == "per-session":
                     logger.debug(
@@ -785,11 +830,23 @@ class HonchoMemoryProvider(MemoryProvider):
                     )
                     with self._prefetch_lock:
                         _prewarm_generation = self._generic_prewarm_generation
+                    _prewarm_context = manager._new_operation_context(
+                        "generic dialectic prewarm"
+                    )
+                    _prewarm_scope = (
+                        cfg.workspace_id,
+                        session.honcho_session_id,
+                        session.user_peer_id,
+                        session.assistant_peer_id,
+                        manager._client_generation,
+                    )
 
                     def _prewarm_dialectic() -> None:
                         try:
                             r = self._run_dialectic_depth(
-                                _prewarm_query, use_query_rewrite=False
+                                _prewarm_query,
+                                use_query_rewrite=False,
+                                context=_prewarm_context,
                             )
                         except Exception as exc:
                             logger.debug("Honcho dialectic prewarm failed: %s", exc)
@@ -803,6 +860,7 @@ class HonchoMemoryProvider(MemoryProvider):
                                 return
                             self._generic_prewarm_state = "ready"
                             self._generic_prewarm_result = r if r and r.strip() else ""
+                            self._generic_prewarm_scope = _prewarm_scope
 
                     self._prefetch_thread_started_at = time.monotonic()
                     prewarm_thread = self._start_owned_worker(
@@ -829,7 +887,12 @@ class HonchoMemoryProvider(MemoryProvider):
         finally:
             self._finish_initialization(record, succeeded=succeeded)
 
-    def _ensure_session(self) -> bool:
+    def _ensure_session(
+        self,
+        *,
+        context: Optional[ProviderTurnContext | ProviderOperationContext] = None,
+        turn_number: Optional[int] = None,
+    ) -> bool:
         """Lazily initialize the Honcho session (for tools-only mode).
 
         Returns True if the manager is ready, False otherwise.
@@ -849,6 +912,8 @@ class HonchoMemoryProvider(MemoryProvider):
             self._do_session_init(
                 self._config,
                 self._lazy_init_session_id or "hermes-default",
+                context=context,
+                turn_number=turn_number,
                 **self._lazy_init_kwargs,
             )
             # Clear lazy refs
@@ -890,34 +955,66 @@ class HonchoMemoryProvider(MemoryProvider):
             return True
         return not (self._init_thread and self._init_thread.is_alive())
 
-    def _format_first_turn_context(self, ctx: dict) -> str:
-        """Format the prefetch context dict into a readable system prompt block."""
-        parts = []
+    def _model_renderer(self, context: object | None = None) -> ModelFacingRenderer:
+        return renderer_for_context(context or self._turn_context)
 
-        # Session summary — session-scoped context, placed first for relevance
-        summary = ctx.get("summary", "")
-        if summary:
-            parts.append(f"## Session Summary\n{summary}")
-
-        rep = ctx.get("representation", "")
-        if rep:
-            parts.append(f"## User Representation\n{rep}")
-
-        card = ctx.get("card", "")
-        if card:
-            parts.append(f"## User Peer Card\n{card}")
-
-        ai_rep = ctx.get("ai_representation", "")
-        if ai_rep:
-            parts.append(f"## AI Self-Representation\n{ai_rep}")
-
-        ai_card = ctx.get("ai_card", "")
-        if ai_card:
-            parts.append(f"## AI Identity Card\n{ai_card}")
-
-        if not parts:
+    def _render_context_payload(
+        self, ctx: object, *, first_turn: bool, context: object | None = None
+    ) -> str:
+        """Select and render the approved model-facing context structure."""
+        if not isinstance(ctx, dict):
             return ""
+        renderer = self._model_renderer(context)
+        headings = {
+            "direct_evidence": "Direct Conversation Evidence",
+            "summary": "Session Summary" if first_turn else "Summary",
+            "representation": "User Representation" if first_turn else "Representation",
+            "card": "User Peer Card" if first_turn else "Card",
+            "ai_representation": "AI Self-Representation",
+            "ai_card": "AI Identity Card",
+        }
+        list_fields = {"card", "ai_card"}
+        parts: list[str] = []
+        for field_name, heading in headings.items():
+            value = ctx.get(field_name)
+            if field_name == "direct_evidence" and isinstance(value, str):
+                lines = [
+                    renderer.render(
+                        claim,
+                        provenance="Direct conversation evidence",
+                    )
+                    for claim in value.split("\n\n")
+                    if claim.strip()
+                ]
+            else:
+                lines = (
+                    renderer.semantic_lines(value)
+                    if field_name in list_fields
+                    else [renderer.semantic_text(value)]
+                )
+            text = "\n".join(line for line in lines if line)
+            if text:
+                parts.append(f"## {heading}\n{text}")
+
+        messages = ctx.get("recent_messages")
+        if isinstance(messages, (list, tuple)):
+            rendered_messages: list[str] = []
+            for message in messages[-5:]:
+                if not isinstance(message, dict):
+                    continue
+                role = message.get("role")
+                if role not in {"user", "assistant"}:
+                    role = "conversation"
+                content = renderer.semantic_text(message.get("content"))
+                if content:
+                    rendered_messages.append(f"  [{role}] {content[:200]}")
+            if rendered_messages:
+                parts.append("## Recent messages\n" + "\n".join(rendered_messages))
         return "\n\n".join(parts)
+
+    def _format_first_turn_context(self, ctx: dict) -> str:
+        """Structurally render prefetch context for first and resumed turns."""
+        return self._render_context_payload(ctx, first_turn=True)
 
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
@@ -1031,15 +1128,30 @@ class HonchoMemoryProvider(MemoryProvider):
 
             if _first_base_fetch and self._manager:
                 _ctx_holder: dict[str, dict] = {}
+                turn_context = self._turn_context
 
                 def _fetch_base() -> None:
                     try:
-                        ctx = self._manager.get_prefetch_context(
-                            self._session_key, query or None
-                        ) or {}
+                        if turn_context is None:
+                            ctx = self._manager.get_prefetch_context(
+                                self._session_key, query or None
+                            ) or {}
+                        else:
+                            ctx = self._manager.get_prefetch_context(
+                                self._session_key, query or None,
+                                context=turn_context,
+                            ) or {}
                         _ctx_holder["ctx"] = ctx
-                        if ctx:
-                            self._manager.set_context_result(self._session_key, ctx)
+                        if ctx and turn_context is not None:
+                            session = self._manager._cache.get(self._session_key)
+                            if session is not None:
+                                self._manager.set_context_result(
+                                    self._session_key,
+                                    ctx,
+                                    context=turn_context,
+                                    peer_id=session.user_peer_id,
+                                    source="prefetch",
+                                )
                     except Exception as e:
                         logger.debug("Honcho first-turn base context failed: %s", e)
 
@@ -1054,7 +1166,15 @@ class HonchoMemoryProvider(MemoryProvider):
                     _bt.join(timeout=_base_wait)
                 _ctx = _ctx_holder.get("ctx")
                 if _ctx:
-                    self._manager.pop_context_result(self._session_key)
+                    if turn_context is not None:
+                        session = self._manager._cache.get(self._session_key)
+                        if session is not None:
+                            self._manager.pop_context_result(
+                                self._session_key,
+                                context=turn_context,
+                                peer_id=session.user_peer_id,
+                                source="prefetch",
+                            )
                     formatted = self._format_first_turn_context(_ctx)
                     if formatted:
                         with self._base_context_lock:
@@ -1068,7 +1188,17 @@ class HonchoMemoryProvider(MemoryProvider):
 
             # Later turns consume the refresh queued by the previous turn.
             if not _first_base_fetch and self._manager:
-                fresh_ctx = self._manager.pop_context_result(self._session_key)
+                session = self._manager._cache.get(self._session_key)
+                fresh_ctx = (
+                    self._manager.pop_context_result(
+                        self._session_key,
+                        context=self._turn_context,
+                        peer_id=session.user_peer_id,
+                        source="prefetch",
+                    )
+                    if session is not None and self._turn_context is not None
+                    else {}
+                )
                 if fresh_ctx:
                     formatted = self._format_first_turn_context(fresh_ctx)
                     if formatted:
@@ -1095,13 +1225,17 @@ class HonchoMemoryProvider(MemoryProvider):
             else:
                 _first_turn_timeout = _dia_wait
                 _fired_at = self._turn_count
+                turn_context = self._turn_context
                 with self._prefetch_lock:
                     self._dialectic_generation += 1
                     _generation = self._dialectic_generation
 
                 def _run_first_turn() -> None:
                     try:
-                        r = self._run_dialectic_depth(query)
+                        if turn_context is None:
+                            r = self._run_dialectic_depth(query)
+                        else:
+                            r = self._run_dialectic_depth(query, context=turn_context)
                     except Exception as exc:
                         logger.debug("Honcho first-turn dialectic failed: %s", exc)
                         self._note_dialectic_failure(exc, generation=_generation)
@@ -1125,13 +1259,38 @@ class HonchoMemoryProvider(MemoryProvider):
         # Consume only results that are already ready; later turns never wait.
         dialectic_result = self._consume_pending_dialectic()
         if not dialectic_result and self._turn_count <= 1:
+            expected_prewarm_scope = None
+            turn_context = self._turn_context
+            if turn_context is not None and self._manager is not None:
+                try:
+                    self._manager.prove_workspace_scope(turn_context)
+                    turn_context.require_scope(
+                        workspace=turn_context.workspace,
+                        session=turn_context.session,
+                        peer=turn_context.user_peer,
+                    )
+                    expected_prewarm_scope = (
+                        turn_context.workspace,
+                        turn_context.session,
+                        turn_context.user_peer,
+                        turn_context.ai_peer,
+                        self._manager._client_generation,
+                    )
+                except Exception:
+                    expected_prewarm_scope = None
             with self._prefetch_lock:
-                if self._generic_prewarm_state == "ready":
+                if (
+                    self._generic_prewarm_state == "ready"
+                    and expected_prewarm_scope is not None
+                    and self._generic_prewarm_scope == expected_prewarm_scope
+                ):
                     dialectic_result = self._generic_prewarm_result
-                    self._generic_prewarm_result = ""
+                self._generic_prewarm_result = ""
+                self._generic_prewarm_scope = None
         elif dialectic_result and self._turn_count <= 1:
             with self._prefetch_lock:
                 self._generic_prewarm_result = ""
+                self._generic_prewarm_scope = None
 
         if dialectic_result and dialectic_result.strip():
             parts.append(dialectic_result)
@@ -1163,7 +1322,7 @@ class HonchoMemoryProvider(MemoryProvider):
         return (
             "[Honcho memory status] Authentication with the Honcho memory backend "
             "has expired and automatic token refresh failed, so memory sync and "
-            f"recall are paused. Reason: {msg}\n"
+            "Recall is paused; the configured Honcho credential was rejected.\n"
             "Tell the user (once) that Honcho memory is paused and that running "
             "'hermes honcho setup' to re-authenticate will restore it."
         )
@@ -1188,7 +1347,9 @@ class HonchoMemoryProvider(MemoryProvider):
                 "turn=%d, limit=%d", fired_at, self._turn_count, stale_limit,
             )
             return ""
-        return dialectic_result if (dialectic_result and dialectic_result.strip()) else ""
+        if not (dialectic_result and dialectic_result.strip()):
+            return ""
+        return self._model_renderer().semantic_text(dialectic_result)
 
     def _truncate_to_budget(self, text: str) -> str:
         """Truncate text to fit within context_tokens budget if set."""
@@ -1226,7 +1387,9 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._injection_frequency != "first-turn" and context_due:
             self._last_context_turn = self._turn_count
             try:
-                self._manager.prefetch_context(self._session_key, query)
+                self._manager.prefetch_context(
+                    self._session_key, query, context=self._turn_context
+                )
             except Exception as e:
                 logger.debug("Honcho context prefetch failed: %s", e)
 
@@ -1256,10 +1419,11 @@ class HonchoMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._dialectic_generation += 1
             _generation = self._dialectic_generation
+        turn_context = self._turn_context
 
         def _run():
             try:
-                result = self._run_dialectic_depth(query)
+                result = self._run_dialectic_depth(query, context=turn_context)
             except Exception as e:
                 logger.debug("Honcho prefetch failed: %s", e)
                 self._note_dialectic_failure(e, generation=_generation)
@@ -1485,7 +1649,13 @@ class HonchoMemoryProvider(MemoryProvider):
         # Long enough even without structure
         return len(result.strip()) > 300
 
-    def _run_dialectic_depth(self, query: str, *, use_query_rewrite: bool = True) -> str:
+    def _run_dialectic_depth(
+        self,
+        query: str,
+        *,
+        use_query_rewrite: bool = True,
+        context: Optional[ProviderTurnContext | ProviderOperationContext] = None,
+    ) -> str:
         """Execute up to dialecticDepth .chat() calls with conditional bail-out.
 
         Cold start (no base context): general user-oriented query.
@@ -1495,6 +1665,8 @@ class HonchoMemoryProvider(MemoryProvider):
         """
         if not self._manager or not self._session_key:
             return ""
+        if context is None:
+            context = self._manager._new_operation_context("dialectic composite")
 
         is_cold = not self._base_context_cache
         results: list[str] = []
@@ -1533,10 +1705,8 @@ class HonchoMemoryProvider(MemoryProvider):
                          self._dialectic_depth, i, level, is_cold)
 
             result = self._manager.dialectic_query(
-                self._session_key, prompt,
-                reasoning_level=level,
-                peer="user",
-                relevance_query=query,
+                self._session_key, prompt, reasoning_level=level,
+                peer="user", relevance_query=query, context=context,
             )
             results.append(result or "")
 
@@ -1559,8 +1729,36 @@ class HonchoMemoryProvider(MemoryProvider):
         return is_trivial_prompt(text)
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Track turn count for cadence and injection_frequency logic."""
+        """Track turn count and create the explicit provider authority."""
         self._turn_count = turn_number
+        self._active_turn_number = turn_number
+        # A worker must retain the object for the turn it belongs to; reading
+        # self._turn_context inside a delayed closure would authorize a later turn.
+        session = None
+        if self._manager and self._session_key:
+            session = getattr(self._manager, "_cache", {}).get(self._session_key)
+        session_id = kwargs.get("session_id") or getattr(session, "honcho_session_id", "")
+        workspace = getattr(self._config, "workspace_id", "") if self._config else ""
+        if not all(
+            isinstance(value, str) and value.strip()
+            for value in (workspace, session_id,
+                          getattr(session, "user_peer_id", None),
+                          getattr(session, "assistant_peer_id", None))
+        ):
+            self._turn_context = None
+            return
+        self._turn_generation += 1
+        timeout = getattr(self._config, "timeout", None) or 30.0
+        self._turn_context = ProviderTurnContext.create(
+            turn=turn_number,
+            generation=self._turn_generation,
+            workspace=workspace,
+            session=session_id,
+            user_peer=session.user_peer_id,
+            ai_peer=session.assistant_peer_id,
+            deadline=time.monotonic() + timeout,
+            total_cap=8,
+        )
 
     @staticmethod
     def _chunk_message(content: str, limit: int) -> list[str]:
@@ -1623,6 +1821,7 @@ class HonchoMemoryProvider(MemoryProvider):
              (honcho-ai server < 3.x)
         """
         cfg = self._config
+        peer_label = peer if peer in {"user", "ai"} else "selected peer"
         reasons: List[str] = []
 
         if cfg is not None:
@@ -1634,7 +1833,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 observe_others = bool(getattr(cfg, "ai_observe_others", True))
             if not (observe_me or observe_others):
                 reasons.append(
-                    f"observation is disabled for peer '{peer}' "
+                    f"observation is disabled for {peer_label} "
                     f"(user_observe_me/ai_observe_me in config)"
                 )
 
@@ -1692,6 +1891,11 @@ class HonchoMemoryProvider(MemoryProvider):
         msg_limit = self._config.message_max_chars if self._config else 25000
         clean_user_content = sanitize_context(user_content or "").strip()
         clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        turn_context: ProviderTurnContext | ProviderOperationContext | None = (
+            self._turn_context
+        )
+        if turn_context is None:
+            turn_context = self._manager._new_operation_context("turn sync")
         # Skip only when the whole turn is empty. An interrupted or tool-only
         # turn can legitimately have an empty assistant side; the user's
         # message must still be persisted (the manager already drops
@@ -1702,7 +1906,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         def _sync():
             try:
-                session = self._manager.get_or_create(self._session_key)
+                session = self._manager.get_or_create(self._session_key, context=turn_context)
                 if clean_user_content:
                     for chunk in self._chunk_message(clean_user_content, msg_limit):
                         session.add_message("user", chunk)
@@ -1712,7 +1916,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 # Route through save() so writeFrequency is honored —
                 # _flush_session() directly bypassed "session"/N batching
                 # and flushed every turn regardless of config.
-                self._manager.save(session)
+                self._manager.save(session, context=turn_context)
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
 
@@ -1751,9 +1955,16 @@ class HonchoMemoryProvider(MemoryProvider):
             self._start_session_init_background()
             return
 
+        # Captured now, not read inside the delayed closure: a worker must
+        # authorize against the context of the turn it belongs to, not
+        # whatever turn happens to be current when it runs (see on_turn_start).
+        turn_context = self._turn_context
+
         def _write():
             try:
-                self._manager.create_conclusion(self._session_key, content)
+                self._manager.create_conclusion(
+                    self._session_key, content, context=turn_context
+                )
             except Exception as e:
                 logger.debug("Honcho memory mirror failed: %s", e)
 
@@ -1810,45 +2021,92 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._cron_skipped:
             return tool_error("Honcho is not active (cron context).")
 
+        live_turn_pending = (
+            self._turn_context is None and self._active_turn_number is not None
+        )
+        tool_context: ProviderTurnContext | ProviderOperationContext | None = (
+            self._turn_context
+        )
+        if tool_context is None and not live_turn_pending:
+            timeout = getattr(self._config, "timeout", None) or 30.0
+            workspace = getattr(self._config, "workspace_id", "") or "hermes"
+            tool_context = ProviderOperationContext.create(
+                operation="tool operation",
+                workspace=workspace,
+                timeout=min(float(timeout), 30.0),
+                total_cap=16,
+            )
+
         if not self._session_initialized:
             if self._init_thread and self._init_thread.is_alive():
                 return tool_error("Honcho session is still initializing; try again shortly.")
-            if not self._ensure_session():
+            if not self._ensure_session(
+                context=tool_context,
+                turn_number=self._active_turn_number if live_turn_pending else None,
+            ):
                 if self._init_auth_failure:
                     return tool_error(
-                        f"Honcho memory authentication failed: {self._init_auth_failure}"
+                        "Honcho memory authentication failed; re-authentication is required."
                     )
                 return tool_error("Honcho session could not be initialized.")
+            if live_turn_pending:
+                tool_context = self._turn_context
 
         if not self._manager or not self._session_key:
             return tool_error("Honcho is not active for this session.")
+        if tool_context is None:
+            return tool_error("Honcho operation scope could not be established.")
 
         try:
+            def manager_call(method, *args, **call_kwargs):
+                try:
+                    parameters = inspect.signature(method).parameters.values()
+                    accepts_context = any(
+                        parameter.name == "context"
+                        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters
+                    )
+                except (TypeError, ValueError):
+                    accepts_context = True
+                if accepts_context:
+                    call_kwargs["context"] = tool_context
+                return method(*args, **call_kwargs)
             if tool_name == "honcho_profile":
                 peer = args.get("peer", "user")
                 card_update = args.get("card")
                 if card_update:
-                    result = self._manager.set_peer_card(self._session_key, card_update, peer=peer)
+                    result = manager_call(self._manager.set_peer_card, self._session_key, card_update, peer=peer)
                     if result is None:
                         return tool_error("Failed to update peer card.")
-                    return json.dumps({"result": f"Peer card updated ({len(result)} facts).", "card": result})
-                card = self._manager.get_peer_card(self._session_key, peer=peer)
+                    card = self._model_renderer(tool_context).semantic_lines(result)
+                    return json.dumps(
+                        {
+                            "result": f"Peer card updated ({len(card)} facts).",
+                            "card": card,
+                        }
+                    )
+                card = manager_call(self._manager.get_peer_card, self._session_key, peer=peer)
                 if not card:
                     return json.dumps(self._empty_profile_hint(peer))
-                return json.dumps({"result": card})
+                return json.dumps(
+                    {"result": self._model_renderer(tool_context).semantic_lines(card)}
+                )
 
             elif tool_name == "honcho_search":
                 query = (args.get("query") or "").strip()
                 if not query:
                     return tool_error("Missing required parameter: query")
-                max_tokens = min(int(args.get("max_tokens", 800)), 2000)
+                raw_limit = args.get("max_tokens", 800)
+                max_tokens = raw_limit if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) else 800
+                max_tokens = max(1, min(max_tokens, 2000))
                 peer = args.get("peer", "user")
-                result = self._manager.search_context(
-                    self._session_key, query, max_tokens=max_tokens, peer=peer
-                )
+                result = manager_call(self._manager.search_context,
+                    self._session_key, query, max_tokens=max_tokens, peer=peer)
                 if not result:
                     return json.dumps({"result": "No relevant context found."})
-                return json.dumps({"result": result})
+                return json.dumps(
+                    {"result": self._model_renderer(tool_context).semantic_text(result)}
+                )
 
             elif tool_name == "honcho_reasoning":
                 query = (args.get("query") or "").strip()
@@ -1863,7 +2121,7 @@ class HonchoMemoryProvider(MemoryProvider):
                     self._generic_prewarm_result = ""
                     self._generic_prewarm_generation += 1
                 try:
-                    result = self._manager.dialectic_query(
+                    result = manager_call(self._manager.dialectic_query,
                         self._session_key, query,
                         reasoning_level=reasoning_level,
                         peer=peer,
@@ -1877,42 +2135,30 @@ class HonchoMemoryProvider(MemoryProvider):
                 except HonchoAuthError:
                     # Let the outer dispatch's auth-specific handler render this.
                     raise
-                except Exception as e:
-                    logger.warning("honcho_reasoning failed: %s", e)
+                except Exception:
+                    logger.warning(
+                        "honcho_reasoning status=failed reason=provider_unavailable"
+                    )
                     return tool_error(
-                        f"Honcho reasoning query failed ({e}). This is a backend "
-                        "error, not an empty result — the peer may still have "
-                        "relevant context. Slow dialectic calls at higher "
-                        "reasoning levels can exceed the configured timeout; "
-                        "consider a lower reasoning_level or raising the "
-                        "'timeout' value in honcho.json."
+                        "Honcho reasoning is temporarily unavailable; no result was "
+                        "returned. Try again or use a lower reasoning level."
                     )
                 # Update cadence tracker so auto-injection respects the gap after an explicit call
                 with self._prefetch_lock:
                     if _tool_generation == self._dialectic_generation:
                         self._last_dialectic_turn = self._turn_count
-                return json.dumps({"result": result or "No result from Honcho."})
+                rendered = self._model_renderer(tool_context).semantic_text(result)
+                return json.dumps({"result": rendered or "No result from Honcho."})
 
             elif tool_name == "honcho_context":
                 peer = args.get("peer", "user")
-                ctx = self._manager.get_session_context(self._session_key, peer=peer)
+                ctx = manager_call(self._manager.get_session_context, self._session_key, peer=peer)
                 if not ctx:
                     return json.dumps({"result": "No context available yet."})
-                parts = []
-                if ctx.get("summary"):
-                    parts.append(f"## Summary\n{ctx['summary']}")
-                if ctx.get("representation"):
-                    parts.append(f"## Representation\n{ctx['representation']}")
-                if ctx.get("card"):
-                    parts.append(f"## Card\n{ctx['card']}")
-                if ctx.get("recent_messages"):
-                    msgs = ctx["recent_messages"]
-                    msg_str = "\n".join(
-                        f"  [{m['role']}] {m['content'][:200]}"
-                        for m in msgs[-5:]  # last 5 for brevity
-                    )
-                    parts.append(f"## Recent messages\n{msg_str}")
-                return json.dumps({"result": "\n\n".join(parts) or "No context available."})
+                rendered = self._render_context_payload(
+                    ctx, first_turn=False, context=tool_context
+                )
+                return json.dumps({"result": rendered or "No context available."})
 
             elif tool_name == "honcho_conclude":
                 delete_id = (args.get("delete_id") or "").strip()
@@ -1930,18 +2176,37 @@ class HonchoMemoryProvider(MemoryProvider):
                     return tool_error("query is only valid when list is true.")
 
                 if list_mode:
-                    conclusions = self._manager.list_conclusions(
-                        self._session_key, query=query or None, peer=peer
-                    )
-                    return json.dumps({"conclusions": conclusions})
+                    conclusions = manager_call(self._manager.list_conclusions,
+                        self._session_key, query=query or None, peer=peer)
+                    safe_conclusions = []
+                    if isinstance(conclusions, (list, tuple)):
+                        for item in conclusions:
+                            content = self._model_renderer(tool_context).semantic_text(item)
+                            if not content:
+                                continue
+                            entry = {"content": content}
+                            if isinstance(item, dict):
+                                handle = item.get("handle")
+                                if isinstance(handle, str) and re.fullmatch(
+                                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+                                    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                                    r"[0-9a-fA-F]{12}",
+                                    handle,
+                                ):
+                                    entry["handle"] = handle
+                            safe_conclusions.append(entry)
+                    return json.dumps({"conclusions": safe_conclusions})
                 if has_delete_id:
-                    ok = self._manager.delete_conclusion(self._session_key, delete_id, peer=peer)
+                    ok = manager_call(self._manager.delete_conclusion, self._session_key, delete_id, peer=peer)
                     if ok:
-                        return json.dumps({"result": f"Conclusion {delete_id} deleted."})
-                    return tool_error(f"Failed to delete conclusion {delete_id}.")
-                ok = self._manager.create_conclusion(self._session_key, conclusion, peer=peer)
+                        return json.dumps({"result": "Conclusion deleted."})
+                    return tool_error("Conclusion could not be deleted.")
+                ok = manager_call(self._manager.create_conclusion, self._session_key, conclusion, peer=peer)
                 if ok:
-                    return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})
+                    safe_peer = peer if peer in {"user", "ai"} else "selected peer"
+                    return json.dumps(
+                        {"result": f"Conclusion saved for {safe_peer}."}
+                    )
                 return tool_error("Failed to save conclusion.")
 
             return tool_error(f"Unknown tool: {tool_name}")
@@ -1949,10 +2214,10 @@ class HonchoMemoryProvider(MemoryProvider):
         except HonchoAuthError as e:
             # Never report an auth failure as an empty result; the model would read it as "no memory".
             logger.error("Honcho tool %s failed: authentication rejected", tool_name)
-            return tool_error(f"Honcho memory authentication failed: {e}")
+            return tool_error("Honcho memory authentication failed; re-authentication is required.")
         except Exception as e:
             logger.error("Honcho tool %s failed: %s", tool_name, e)
-            return tool_error(f"Honcho {tool_name} failed: {e}")
+            return tool_error(f"Honcho {tool_name} failed; no context was returned.")
 
     def shutdown(
         self,

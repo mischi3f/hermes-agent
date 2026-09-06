@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unicodedata
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from honcho.peer import Peer
 
 from plugins.memory.honcho import context_selection as selection
 from plugins.memory.honcho.context_selection import (
@@ -17,6 +19,29 @@ from plugins.memory.honcho import HonchoMemoryProvider
 
 FACILITY = "Pinewood Athletic Complex is the possible future tournament location."
 CONCERN = "The unresolved concern is insufficient shaded spectator seating."
+
+
+def _manager_with_dialectic(raw: str) -> HonchoSessionManager:
+    client = SimpleNamespace(workspace_id="hermes")
+    manager = HonchoSessionManager(
+        honcho=client,
+        config=HonchoClientConfig(
+            workspace_id="hermes",
+            api_key="synthetic-test-key",
+            enabled=True,
+            dialectic_max_chars=600,
+        ),
+    )
+    manager._cache["synthetic"] = HonchoSession(
+        key="synthetic",
+        user_peer_id="synthetic-user",
+        assistant_peer_id="synthetic-ai",
+        honcho_session_id="synthetic-session",
+    )
+    peer = Peer("synthetic-ai", client)
+    object.__setattr__(peer, "chat", lambda *args, **kwargs: raw)
+    manager._get_or_create_peer = lambda peer_id, *, context=None: peer
+    return manager
 
 
 def semantic_pinewood_match(text: str) -> bool:
@@ -134,19 +159,7 @@ def test_pinewood_regression_keeps_facility_and_complete_concern_under_600():
 def test_dialectic_query_uses_complete_relevance_selection_at_configured_cap(monkeypatch):
     prefix = "General policy detail is less relevant. " * 25
     raw = f"{prefix}{FACILITY} {CONCERN}"
-    config = HonchoClientConfig(
-        api_key="synthetic-test-key",
-        enabled=True,
-        dialectic_max_chars=600,
-    )
-    manager = HonchoSessionManager(honcho=MagicMock(), config=config)
-    manager._cache["synthetic"] = HonchoSession(
-        key="synthetic",
-        user_peer_id="synthetic-user",
-        assistant_peer_id="synthetic-ai",
-        honcho_session_id="synthetic-session",
-    )
-    monkeypatch.setattr(manager, "_authed_call", lambda _name, _call: raw)
+    manager = _manager_with_dialectic(raw)
 
     result = manager.dialectic_query(
         "synthetic",
@@ -169,19 +182,7 @@ def test_production_depth_path_uses_original_query_with_unique_filler(monkeypatc
         for word in filler_words
     )
     raw = f"{filler} {FACILITY} {CONCERN}"
-    config = HonchoClientConfig(
-        api_key="synthetic-test-key",
-        enabled=True,
-        dialectic_max_chars=600,
-    )
-    manager = HonchoSessionManager(honcho=MagicMock(), config=config)
-    manager._cache["synthetic"] = HonchoSession(
-        key="synthetic",
-        user_peer_id="synthetic-user",
-        assistant_peer_id="synthetic-ai",
-        honcho_session_id="synthetic-session",
-    )
-    monkeypatch.setattr(manager, "_authed_call", lambda _name, _call: raw)
+    manager = _manager_with_dialectic(raw)
     provider = HonchoMemoryProvider()
     provider._manager = manager
     provider._session_key = "synthetic"

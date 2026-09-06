@@ -85,14 +85,17 @@ def _ensure_peer_exists(host_key: str | None = None) -> bool:
     """
     try:
         from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
+        from plugins.memory.honcho.session import HonchoSessionManager
         hcfg = HonchoClientConfig.from_global_config(host=host_key)
         if not hcfg.enabled or not (hcfg.api_key or hcfg.base_url):
             return False
         client = get_honcho_client(hcfg)
+        manager = HonchoSessionManager(honcho=client, config=hcfg)
+        context = manager._new_operation_context("peer initialization")
         # peer() is idempotent -- creates if missing, returns if exists
-        client.peer(hcfg.ai_peer)
+        manager._get_or_create_peer(hcfg.ai_peer, context=context)
         if hcfg.peer_name:
-            client.peer(hcfg.peer_name)
+            manager._get_or_create_peer(hcfg.peer_name, context=context)
         return True
     except Exception:
         return False
@@ -1237,10 +1240,11 @@ def _show_peer_cards(hcfg, client) -> None:
         from plugins.memory.honcho.session import HonchoSessionManager
         mgr = HonchoSessionManager(honcho=client, config=hcfg)
         session_key = hcfg.resolve_session_name()
-        mgr.get_or_create(session_key)
+        context = mgr._new_operation_context("status inspection")
+        mgr.get_or_create(session_key, context=context)
 
         # User peer card
-        card = mgr.get_peer_card(session_key)
+        card = mgr.get_peer_card(session_key, context=context)
         if card:
             print(f"\n  User peer card ({len(card)} facts):")
             for fact in card[:10]:
@@ -1248,8 +1252,7 @@ def _show_peer_cards(hcfg, client) -> None:
             if len(card) > 10:
                 print(f"    ... and {len(card) - 10} more")
 
-        # AI peer representation
-        ai_rep = mgr.get_ai_representation(session_key)
+        ai_rep = mgr.get_ai_representation(session_key, context=context)
         ai_text = ai_rep.get("representation", "")
         if ai_text:
             # Truncate to first 200 chars
@@ -1538,7 +1541,8 @@ def cmd_identity(args) -> None:
         client = get_honcho_client(hcfg)
         mgr = HonchoSessionManager(honcho=client, config=hcfg)
         session_key = hcfg.resolve_session_name()
-        mgr.get_or_create(session_key)
+        context = mgr._new_operation_context("identity command")
+        mgr.get_or_create(session_key, context=context)
     except Exception as e:
         print(f"  Honcho connection failed: {e}\n")
         return
@@ -1546,8 +1550,8 @@ def cmd_identity(args) -> None:
     if show:
         from plugins.memory.honcho.session import HonchoAuthError
         try:
-            user_card = mgr.get_peer_card(session_key)
-            ai_rep = mgr.get_ai_representation(session_key)
+            user_card = mgr.get_peer_card(session_key, context=context)
+            ai_rep = mgr.get_ai_representation(session_key, context=context)
         except HonchoAuthError as e:
             print(f"  Honcho authentication failed: {e}\n")
             return
@@ -1593,7 +1597,9 @@ def cmd_identity(args) -> None:
         return
 
     source = p.name
-    ok = mgr.seed_ai_identity(session_key, content, source=source)
+    ok = mgr.seed_ai_identity(
+        session_key, content, source=source, context=context
+    )
     if ok:
         print(f"  Seeded AI peer identity from {p.name} into session '{session_key}'")
         print(f"  Honcho will incorporate this into {hcfg.ai_peer}'s representation over time.\n")
@@ -1715,12 +1721,15 @@ def cmd_migrate(args) -> None:
                     client = get_honcho_client(hcfg)
                     mgr = HonchoSessionManager(honcho=client, config=hcfg)
                     session_key = hcfg.resolve_session_name()
-                    mgr.get_or_create(session_key)
+                    context = mgr._new_operation_context("memory migration command")
+                    mgr.get_or_create(session_key, context=context)
                     # Upload from each directory that had user files
                     dirs_with_files = set(str(f.parent) for f in user_files)
                     any_uploaded = False
                     for d in dirs_with_files:
-                        if mgr.migrate_memory_files(session_key, d):
+                        if mgr.migrate_memory_files(
+                            session_key, d, context=context
+                        ):
                             any_uploaded = True
                     if any_uploaded:
                         print(f"  Uploaded user memory files from: {', '.join(dirs_with_files)}")
@@ -1765,11 +1774,14 @@ def cmd_migrate(args) -> None:
                     client = get_honcho_client(hcfg)
                     mgr = HonchoSessionManager(honcho=client, config=hcfg)
                     session_key = hcfg.resolve_session_name()
-                    mgr.get_or_create(session_key)
+                    context = mgr._new_operation_context("identity migration command")
+                    mgr.get_or_create(session_key, context=context)
                     for f in agent_files:
                         content = f.read_text(encoding="utf-8").strip()
                         if content:
-                            ok = mgr.seed_ai_identity(session_key, content, source=f.name)
+                            ok = mgr.seed_ai_identity(
+                                session_key, content, source=f.name, context=context
+                            )
                             status = "seeded" if ok else "failed"
                             print(f"    {f.name}: {status}")
                 except Exception as e:

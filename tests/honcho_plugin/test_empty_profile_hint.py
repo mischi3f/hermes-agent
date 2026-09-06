@@ -23,6 +23,8 @@ def _make_provider(**cfg_overrides) -> HonchoMemoryProvider:
     cfg.ai_observe_me = cfg_overrides.get("ai_observe_me", True)
     cfg.ai_observe_others = cfg_overrides.get("ai_observe_others", True)
     cfg.message_max_chars = 25000
+    cfg.workspace_id = "workspace-synthetic"
+    cfg.timeout = 10.0
     provider._config = cfg
 
     provider._dialectic_cadence = cfg_overrides.get("dialectic_cadence", 1)

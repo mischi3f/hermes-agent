@@ -10,6 +10,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from honcho.api_types import MessageResponse, PeerContextResponse
+from honcho.message import Message
+from honcho.peer import Peer
+from honcho.session import Session, SessionPeerConfig
+from honcho.session_context import SessionContext
 
 from plugins.memory.honcho import HonchoMemoryProvider
 from plugins.memory.honcho import oauth
@@ -280,14 +285,51 @@ class _FlakyPeer:
         return self.result
 
 
-def _make_manager(peer, *, reauth_ok=True):
-    cfg = HonchoClientConfig(host="hermes", api_key="hch-at-x", enabled=True)
-    mgr = HonchoSessionManager(config=cfg)
+def _make_manager(peer, *, reauth_ok=True, config_path=None, honcho=None):
+    cfg = HonchoClientConfig(
+        host="hermes", workspace_id="workspace-synthetic", api_key="hch-at-x",
+        enabled=True, config_path=config_path,
+    )
+    client = honcho or SimpleNamespace(workspace_id="workspace-synthetic")
+    if not isinstance(getattr(client, "workspace_id", None), str):
+        client.workspace_id = "workspace-synthetic"
+    mgr = HonchoSessionManager(honcho=client, config=cfg)
     session = HonchoSession(
         key="k", user_peer_id="u", assistant_peer_id="a", honcho_session_id="s"
     )
     mgr._cache["k"] = session
-    mgr._get_or_create_peer = lambda peer_id: peer
+
+    def exact_peer(peer_id, *, context=None):
+        sdk_peer = Peer(peer_id, mgr.honcho)
+        if hasattr(peer, "chat"):
+            object.__setattr__(sdk_peer, "chat", peer.chat)
+        if hasattr(peer, "context"):
+            def context_call(**kwargs):
+                value = peer.context(**kwargs)
+                if type(value) is PeerContextResponse:
+                    return value
+                return PeerContextResponse(
+                    peer_id=peer_id,
+                    target_id=kwargs.get("target") or peer_id,
+                    representation=getattr(value, "representation", None),
+                    peer_card=getattr(value, "peer_card", None),
+                )
+
+            object.__setattr__(sdk_peer, "context", context_call)
+        representation = getattr(peer, "representation", None)
+        if callable(representation):
+            object.__setattr__(sdk_peer, "representation", representation)
+        elif isinstance(representation, str):
+            object.__setattr__(
+                sdk_peer, "representation", lambda **kwargs: representation
+            )
+        if hasattr(peer, "get_card"):
+            object.__setattr__(sdk_peer, "get_card", peer.get_card)
+        if hasattr(peer, "search"):
+            object.__setattr__(sdk_peer, "search", peer.search)
+        return sdk_peer
+
+    mgr._get_or_create_peer = exact_peer
     mgr._force_reauth = lambda: reauth_ok
     return mgr
 
@@ -382,14 +424,33 @@ class _FlakyHonchoSession:
         self.calls += 1
         if self.calls <= self.failures:
             raise Exception("Invalid or expired access token")
+        return [
+            Message.from_api_response(
+                MessageResponse.model_validate(
+                    {
+                        "id": f"message-{self.calls}-{index}",
+                        "content": item.content,
+                        "peer_id": item.peer_id,
+                        "session_id": "s",
+                        "workspace_id": "workspace-synthetic",
+                        "metadata": item.metadata or {},
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "token_count": 1,
+                    }
+                )
+            )
+            for index, item in enumerate(messages)
+        ]
 
 
-def _make_sync_manager(flaky_session, *, reauth_ok=True):
-    cfg = HonchoClientConfig(host="hermes", api_key="hch-at-x", enabled=True)
-    mgr = HonchoSessionManager(config=cfg)
-    peer = MagicMock()
-    peer.message.side_effect = lambda content: content
-    mgr._get_or_create_peer = lambda peer_id: peer
+def _make_sync_manager(flaky_session, *, reauth_ok=True, config_path=None):
+    cfg = HonchoClientConfig(
+        host="hermes", workspace_id="workspace-synthetic", api_key="hch-at-x",
+        enabled=True, config_path=config_path,
+    )
+    client = SimpleNamespace(workspace_id="workspace-synthetic")
+    mgr = HonchoSessionManager(honcho=client, config=cfg)
+    mgr._get_or_create_peer = lambda peer_id, *, context=None: Peer(peer_id, client)
     mgr._sessions_cache["s"] = flaky_session
     mgr._force_reauth = lambda: reauth_ok
     session = HonchoSession(
@@ -468,9 +529,9 @@ def _relogin(path: Path) -> None:
 
 class TestDeadGrantSkipsCalls:
     def test_dead_grant_issues_no_dialectic_call(self, tmp_path, monkeypatch):
-        _kill_grant(tmp_path, monkeypatch)
+        path = _kill_grant(tmp_path, monkeypatch)
         peer = _FlakyPeer(failures=0)
-        mgr = _make_manager(peer)
+        mgr = _make_manager(peer, config_path=path)
         with pytest.raises(HonchoAuthError):
             mgr.dialectic_query("k", "q")
         assert peer.calls == 0
@@ -479,7 +540,7 @@ class TestDeadGrantSkipsCalls:
     def test_relogin_resumes_dialectic_without_waiting(self, tmp_path, monkeypatch):
         path = _kill_grant(tmp_path, monkeypatch)
         peer = _FlakyPeer(failures=0)
-        mgr = _make_manager(peer)
+        mgr = _make_manager(peer, config_path=path)
         with pytest.raises(HonchoAuthError):
             mgr.dialectic_query("k", "q")
         assert peer.calls == 0
@@ -490,9 +551,9 @@ class TestDeadGrantSkipsCalls:
         assert mgr._auth_failure is None
 
     def test_dead_grant_issues_no_sync_call(self, tmp_path, monkeypatch):
-        _kill_grant(tmp_path, monkeypatch)
+        path = _kill_grant(tmp_path, monkeypatch)
         flaky = _FlakyHonchoSession(failures=0)
-        mgr, session = _make_sync_manager(flaky)
+        mgr, session = _make_sync_manager(flaky, config_path=path)
         assert mgr._flush_session(session) is False
         assert flaky.calls == 0
         assert mgr._auth_failure is not None
@@ -500,7 +561,7 @@ class TestDeadGrantSkipsCalls:
     def test_relogin_resumes_sync_without_waiting(self, tmp_path, monkeypatch):
         path = _kill_grant(tmp_path, monkeypatch)
         flaky = _FlakyHonchoSession(failures=0)
-        mgr, session = _make_sync_manager(flaky)
+        mgr, session = _make_sync_manager(flaky, config_path=path)
         assert mgr._flush_session(session) is False
         assert flaky.calls == 0
 
@@ -543,11 +604,12 @@ class TestAuthNotice:
         class _FakeManager:
             def __init__(self):
                 self.notices = ["Invalid or expired access token"]
+                self._cache = {}
 
             def pop_auth_notice(self):
                 return self.notices.pop() if self.notices else None
 
-            def pop_context_result(self, session_key):
+            def pop_context_result(self, session_key, **kwargs):
                 return {}
 
         provider = HonchoMemoryProvider()
@@ -639,9 +701,9 @@ class TestContextAuthRetry:
 
 class TestDeadGrantSkipsContextAndSearch:
     def test_dead_grant_issues_no_context_call(self, tmp_path, monkeypatch):
-        _kill_grant(tmp_path, monkeypatch)
+        path = _kill_grant(tmp_path, monkeypatch)
         peer = _FlakyContextPeer(failures=0)
-        mgr = _make_manager(peer)
+        mgr = _make_manager(peer, config_path=path)
         with pytest.raises(HonchoAuthError):
             mgr.get_session_context("k")
         assert peer.calls == 0
@@ -649,18 +711,19 @@ class TestDeadGrantSkipsContextAndSearch:
     def test_dead_grant_issues_no_search_call(self, tmp_path, monkeypatch):
         from plugins.memory.honcho import session as session_mod
 
-        _kill_grant(tmp_path, monkeypatch)
+        path = _kill_grant(tmp_path, monkeypatch)
         client = MagicMock()
+        client.workspace_id = "workspace-synthetic"
         monkeypatch.setattr(session_mod, "get_honcho_client", lambda *a, **k: client)
-        mgr = _make_manager(_FlakyContextPeer(failures=0))
+        mgr = _make_manager(_FlakyContextPeer(failures=0), config_path=path)
         with pytest.raises(HonchoAuthError):
             mgr.search_context("k", "query")
         client.search.assert_not_called()
 
     def test_dead_grant_prefetch_returns_empty_and_arms_notice(self, tmp_path, monkeypatch):
-        _kill_grant(tmp_path, monkeypatch)
+        path = _kill_grant(tmp_path, monkeypatch)
         peer = _FlakyContextPeer(failures=0)
-        mgr = _make_manager(peer)
+        mgr = _make_manager(peer, config_path=path)
         assert mgr.get_prefetch_context("k") == {}
         assert peer.calls == 0
         assert mgr.pop_auth_notice() is not None
@@ -708,7 +771,7 @@ class TestNonAuthFailuresNotRetried:
         client = MagicMock()
         client.search.side_effect = TimeoutError("request timed out")
         monkeypatch.setattr(session_mod, "get_honcho_client", lambda *a, **k: client)
-        mgr = _make_manager(_TimeoutSearchPeer())
+        mgr = _make_manager(_TimeoutSearchPeer(), honcho=client)
         reauths = []
         mgr._force_reauth = lambda: reauths.append(1) or True
 
@@ -729,6 +792,8 @@ def _wire_rebuild(tmp_path, monkeypatch, fresh_client):
     from plugins.memory.honcho import session as session_mod
 
     clients = {"current": MagicMock()}
+    clients["current"].workspace_id = "workspace-synthetic"
+    fresh_client.workspace_id = "workspace-synthetic"
     monkeypatch.setattr(session_mod, "get_honcho_client", lambda *a, **k: clients["current"])
     monkeypatch.setattr(client_mod, "resolve_config_path", lambda: tmp_path / "honcho.json")
     monkeypatch.setattr(oauth, "force_refresh_token", lambda p, h: "hch-at-rotated")
@@ -742,23 +807,68 @@ def _wire_rebuild(tmp_path, monkeypatch, fresh_client):
 
 class TestClientRebuildRetry:
     def test_flush_retry_uses_rebuilt_session_not_stale(self, tmp_path, monkeypatch):
-        stale_session = MagicMock()
-        stale_session.add_messages.side_effect = Exception("Invalid or expired access token")
-        stale_peer = MagicMock()
-        stale_peer.message.side_effect = lambda content: content
+        old_client = MagicMock()
+        old_client.workspace_id = "workspace-synthetic"
+        stale_session = Session("s", old_client)
+        stale_add = MagicMock(
+            side_effect=Exception("Invalid or expired access token")
+        )
+        object.__setattr__(stale_session, "add_messages", stale_add)
+        stale_peer = Peer("u", old_client)
 
-        fresh_session = MagicMock()
-        fresh_session.context.return_value = SimpleNamespace(summary=None, messages=[])
-        fresh_peer = MagicMock()
-        fresh_peer.message.side_effect = lambda content: content
         fresh_client = MagicMock()
+        fresh_client.workspace_id = "workspace-synthetic"
+        fresh_session = Session("s", fresh_client)
+        fresh_add = MagicMock()
+
+        def add_messages(messages):
+            fresh_add(messages)
+            return [
+                Message.from_api_response(
+                    MessageResponse.model_validate(
+                        {
+                            "id": f"fresh-{index}",
+                            "content": item.content,
+                            "peer_id": item.peer_id,
+                            "session_id": "s",
+                            "workspace_id": "workspace-synthetic",
+                            "metadata": item.metadata or {},
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "token_count": 1,
+                        }
+                    )
+                )
+                for index, item in enumerate(messages)
+            ]
+
+        object.__setattr__(fresh_session, "add_messages", add_messages)
+        object.__setattr__(fresh_session, "add_peers", lambda peers: None)
+        object.__setattr__(
+            fresh_session,
+            "get_peer_configuration",
+            lambda peer: SessionPeerConfig(),
+        )
+        object.__setattr__(
+            fresh_session,
+            "context",
+            lambda **kwargs: SessionContext(
+                session_id="s",
+                messages=[],
+                summary=None,
+                peer_representation=None,
+                peer_card=None,
+            ),
+        )
         fresh_client.session.return_value = fresh_session
-        fresh_client.peer.return_value = fresh_peer
+        fresh_client.peer.side_effect = lambda peer_id: Peer(peer_id, fresh_client)
 
-        _wire_rebuild(tmp_path, monkeypatch, fresh_client)
+        clients = _wire_rebuild(tmp_path, monkeypatch, fresh_client)
 
-        cfg = HonchoClientConfig(host="hermes", api_key="hch-at-x", enabled=True)
-        mgr = HonchoSessionManager(config=cfg)
+        cfg = HonchoClientConfig(
+            host="hermes", workspace_id="workspace-synthetic", api_key="hch-at-x",
+            enabled=True, config_path=tmp_path / "honcho.json",
+        )
+        mgr = HonchoSessionManager(honcho=clients["current"], config=cfg)
         mgr._peers_cache.update({"u": stale_peer, "a": stale_peer})
         mgr._sessions_cache["s"] = stale_session
         session = HonchoSession(
@@ -769,26 +879,41 @@ class TestClientRebuildRetry:
 
         assert mgr._flush_session(session) is True
         # The stale pre-rebuild session must not be retried.
-        assert stale_session.add_messages.call_count == 1
-        assert fresh_session.add_messages.call_count == 1
+        assert stale_add.call_count == 1
+        assert fresh_add.call_count == 1
         assert all(m["_synced"] for m in session.messages)
         assert mgr._auth_failure is None
 
     def test_context_retry_uses_rebuilt_peer_not_stale(self, tmp_path, monkeypatch):
-        stale_peer = MagicMock()
-        stale_peer.context.side_effect = Exception("Invalid or expired access token")
-
-        fresh_peer = MagicMock()
-        fresh_peer.context.return_value = SimpleNamespace(
-            representation="rep after rebuild", peer_card=["fact"]
+        old_client = MagicMock()
+        old_client.workspace_id = "workspace-synthetic"
+        stale_peer = Peer("u", old_client)
+        stale_context = MagicMock(
+            side_effect=Exception("Invalid or expired access token")
         )
+        object.__setattr__(stale_peer, "context", stale_context)
+
         fresh_client = MagicMock()
+        fresh_client.workspace_id = "workspace-synthetic"
+        fresh_peer = Peer("u", fresh_client)
+        fresh_context = MagicMock(
+            return_value=PeerContextResponse(
+                peer_id="u",
+                target_id="u",
+                representation="rep after rebuild",
+                peer_card=["fact"],
+            )
+        )
+        object.__setattr__(fresh_peer, "context", fresh_context)
         fresh_client.peer.return_value = fresh_peer
 
-        _wire_rebuild(tmp_path, monkeypatch, fresh_client)
+        clients = _wire_rebuild(tmp_path, monkeypatch, fresh_client)
 
-        cfg = HonchoClientConfig(host="hermes", api_key="hch-at-x", enabled=True)
-        mgr = HonchoSessionManager(config=cfg)
+        cfg = HonchoClientConfig(
+            host="hermes", workspace_id="workspace-synthetic", api_key="hch-at-x",
+            enabled=True, config_path=tmp_path / "honcho.json",
+        )
+        mgr = HonchoSessionManager(honcho=clients["current"], config=cfg)
         mgr._peers_cache["u"] = stale_peer
         mgr._cache["k"] = HonchoSession(
             key="k", user_peer_id="u", assistant_peer_id="a", honcho_session_id="s"
@@ -796,8 +921,8 @@ class TestClientRebuildRetry:
 
         ctx = mgr.get_session_context("k")
         assert ctx["representation"] == "rep after rebuild"
-        assert stale_peer.context.call_count == 1
-        assert fresh_peer.context.call_count == 1
+        assert stale_context.call_count == 1
+        assert fresh_context.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -872,9 +997,13 @@ def _wire_init(tmp_path, monkeypatch, client, *, recall_mode="hybrid", dead_refr
     monkeypatch.setattr(session_mod, "get_honcho_client", lambda *a, **k: client)
     if dead_refresh:
         monkeypatch.setattr(oauth, "force_refresh_token", lambda p, h: None)
+    # Give the injected client the authenticated workspace metadata that strict
+    # scope proof reads, matching the config below, so proof passes and the
+    # peer/session 401 is what actually surfaces (not a scope-verification error).
+    client.workspace_id = "workspace-synthetic"
     cfg = HonchoClientConfig(
         host="hermes", api_key="hch-at-old", enabled=True, recall_mode=recall_mode,
-        timeout=0.5, session_strategy="per-session",
+        timeout=0.5, session_strategy="per-session", workspace_id="workspace-synthetic",
     )
     monkeypatch.setattr(
         client_mod.HonchoClientConfig, "from_global_config", lambda *a, **k: cfg

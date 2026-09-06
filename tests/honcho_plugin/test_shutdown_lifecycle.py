@@ -18,11 +18,12 @@ def _manager(monkeypatch, *, write_frequency="async") -> HonchoSessionManager:
     from plugins.memory.honcho import session as session_module
 
     client = MagicMock()
+    client.workspace_id = "hermes"
     monkeypatch.setattr(session_module, "get_honcho_client", lambda *a, **k: client)
     return HonchoSessionManager(
         honcho=client,
         config=HonchoClientConfig(
-            api_key="synthetic-test-key",
+            workspace_id="hermes", api_key="synthetic-test-key",
             enabled=True,
             write_frequency=write_frequency,
         ),
@@ -130,7 +131,7 @@ def test_save_admission_cannot_enqueue_after_shutdown_drain(monkeypatch):
 
     manager._async_queue = BlockingQueue()
     monkeypatch.setattr(manager, "_ensure_async_writer", lambda: None)
-    monkeypatch.setattr(manager, "_flush_session", lambda _session: True)
+    monkeypatch.setattr(manager, "_flush_session", lambda session, *, context=None: True)
     saver = threading.Thread(target=manager.save, args=(_session(),))
     saver.start()
     assert put_entered.wait(timeout=1.0)
@@ -239,7 +240,7 @@ def test_timed_out_flush_worker_cannot_steal_async_sentinel(monkeypatch):
     flush_entered = threading.Event()
     release_flush = threading.Event()
 
-    def controlled_flush(_session):
+    def controlled_flush(_session, *, context=None):
         if threading.current_thread().name == "honcho-async-writer":
             writer_entered.set()
             assert release_writer.wait(timeout=1.0)
@@ -641,7 +642,7 @@ def test_per_session_flush_failure_makes_shutdown_fail_without_content(
     with manager._cache_lock:
         manager._cache["synthetic-session"] = _session()
 
-    def fail_session_flush(_session):
+    def fail_session_flush(_session, *, context=None):
         raise RuntimeError(secret)
 
     monkeypatch.setattr(manager, "_flush_session", fail_session_flush)
@@ -935,32 +936,33 @@ def test_get_honcho_client_rejects_closed_key_until_explicit_reset(monkeypatch):
 
 
 def test_manager_closes_client_once_and_clears_reference(monkeypatch):
-    from plugins.memory.honcho import session as session_module
+    from plugins.memory.honcho import client as client_module
 
     manager = _manager(monkeypatch, write_frequency="turn")
-    close_client = MagicMock(return_value=True)
-    monkeypatch.setattr(session_module, "close_honcho_client", close_client)
+    close_transport = MagicMock(wraps=client_module._close_generation_transport)
+    monkeypatch.setattr(client_module, "_close_generation_transport", close_transport)
     owned_client = manager._honcho
 
     assert manager.shutdown(timeout=1.0, flush=False) is True
     assert manager.shutdown(timeout=1.0, flush=False) is True
 
-    close_client.assert_called_once_with(owned_client, manager._config)
+    close_transport.assert_called_once()
+    assert close_transport.call_args.args[0].client is owned_client
     assert manager._honcho is None
 
 
 def test_client_close_failure_fails_shutdown_without_exception_content(
     monkeypatch, caplog
 ):
-    from plugins.memory.honcho import session as session_module
+    from plugins.memory.honcho import client as client_module
 
     manager = _manager(monkeypatch, write_frequency="turn")
     secret = "sensitive-client-close-exception-content"
 
-    def fail_close(_client, _config):
+    def fail_close(_record):
         raise RuntimeError(secret)
 
-    monkeypatch.setattr(session_module, "close_honcho_client", fail_close)
+    monkeypatch.setattr(client_module, "_close_generation_transport", fail_close)
 
     with caplog.at_level(logging.ERROR):
         assert manager.shutdown(timeout=1.0, flush=False) is False
@@ -986,18 +988,25 @@ def test_shutdown_manager_cannot_reacquire_client(monkeypatch):
 
 
 def test_http_close_timeout_fails_closed_and_uses_outer_deadline(monkeypatch):
-    from plugins.memory.honcho import session as session_module
+    from plugins.memory.honcho import client as client_module
 
     manager = _manager(monkeypatch, write_frequency="turn")
     entered = threading.Event()
     release = threading.Event()
 
-    def blocked_close(_client, _config):
+    def blocked_close(_record):
         entered.set()
         assert release.wait(timeout=1.0)
+        # Honor the real _close_generation_transport postcondition once released:
+        # close_honcho_client blocks in record.finished.wait() until the close
+        # state/result are published under the registry lock.
+        with client_module._client_slots_lock:
+            _record.close_result = True
+            _record.state = "closed"
+            _record.finished.set()
         return True
 
-    monkeypatch.setattr(session_module, "close_honcho_client", blocked_close)
+    monkeypatch.setattr(client_module, "_close_generation_transport", blocked_close)
     started = time.monotonic()
     assert manager.shutdown(timeout=0.05, flush=False) is False
     elapsed = time.monotonic() - started
@@ -1408,8 +1417,8 @@ def test_shared_client_closes_only_after_all_managers_flush(monkeypatch):
         flush_order.append(label)
         return True
 
-    monkeypatch.setattr(first, "_flush_session", lambda _session: flush("first"))
-    monkeypatch.setattr(second, "_flush_session", lambda _session: flush("second"))
+    monkeypatch.setattr(first, "_flush_session", lambda session, *, context=None: flush("first"))
+    monkeypatch.setattr(second, "_flush_session", lambda session, *, context=None: flush("second"))
     provider = HonchoMemoryProvider()
     provider._config = config
     provider._retired_managers.append(first)
@@ -1444,7 +1453,7 @@ def test_failed_initializer_does_not_retire_other_initializer_manager(monkeypatc
     factory_calls = []
     monkeypatch.setattr(client_module, "get_honcho_client", lambda _config: MagicMock())
 
-    def first_get_or_create(_key):
+    def first_get_or_create(_key, *, context=None):
         first_entered.set()
         assert release_first.wait(timeout=1.0)
         raise RuntimeError("synthetic-sensitive-first-init-failure")
@@ -1944,7 +1953,7 @@ def test_manager_success_is_rejected_after_required_close_failure(monkeypatch):
 def test_async_writer_shutdown_drains_and_terminates(monkeypatch):
     manager = _manager(monkeypatch, write_frequency="async")
     flushed = threading.Event()
-    manager._flush_session = lambda _session: flushed.set() or True
+    manager._flush_session = lambda session, *, context=None: flushed.set() or True
 
     manager.save(_session())
     assert manager.shutdown(timeout=1.0) is True
@@ -1971,7 +1980,7 @@ def test_provider_shutdown_cleans_manager_in_all_write_modes(
     provider._session_key = "synthetic-session"
 
     if write_frequency == "async":
-        manager._flush_session = lambda _session: True
+        manager._flush_session = lambda session, *, context=None: True
         manager.save(_session())
 
     assert provider.shutdown() is True

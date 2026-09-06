@@ -14,6 +14,10 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+from honcho.api_types import MessageResponse
+from honcho.message import Message
+from honcho.peer import Peer
+from honcho.session import Session
 
 
 from plugins.memory.honcho.client import HonchoClientConfig
@@ -21,6 +25,7 @@ from plugins.memory.honcho.session import (
     HonchoSession,
     HonchoSessionManager,
 )
+from plugins.memory.honcho.turn_context import ProviderTurnContext
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +55,13 @@ def make_manager(monkeypatch):
     guaranteed for every created manager (even on assertion failure)."""
     from plugins.memory.honcho import session as session_module
 
+    # The manager proves its workspace scope from BOTH the config and the
+    # authenticated client's own metadata before any SDK call (strict
+    # propagation). Give the fake client a real workspace_id string that
+    # matches the configured one so scoped operations — memory-file
+    # migration uploads included — verify instead of failing closed.
     client = MagicMock()
+    client.workspace_id = "workspace-synthetic"
     monkeypatch.setattr(session_module, "get_honcho_client", lambda *a, **k: client)
     created = []
 
@@ -60,6 +71,7 @@ def make_manager(monkeypatch):
         runtime_user_peer_name=None,
         **cfg_kwargs,
     ) -> HonchoSessionManager:
+        cfg_kwargs.setdefault("workspace_id", "workspace-synthetic")
         cfg = HonchoClientConfig(
             write_frequency=write_frequency,
             api_key="test-key",
@@ -300,7 +312,7 @@ class TestAsyncWriterThread:
         flushed = []
         flushed_event = threading.Event()
 
-        def capture(session):
+        def capture(session, *, context=None):
             flushed.append(session)
             flushed_event.set()
             return True
@@ -312,6 +324,35 @@ class TestAsyncWriterThread:
         mgr.shutdown()
         assert len(flushed) == 1
         assert flushed[0] is sess
+
+    def test_save_queue_carries_originating_turn_context_to_flush(self, make_manager):
+        mgr = make_manager(write_frequency="async")
+        sess = _make_session()
+        sess.add_message("user", "async msg")
+        context = ProviderTurnContext.create(
+            turn=1,
+            generation=1,
+            workspace="workspace-synthetic",
+            session=sess.honcho_session_id,
+            user_peer=sess.user_peer_id,
+            ai_peer=sess.assistant_peer_id,
+            deadline=100.0,
+            total_cap=8,
+            monotonic=lambda: 0.0,
+        )
+        flushed = threading.Event()
+        received = []
+
+        def capture(session, *, context=None):
+            received.append((session, context))
+            flushed.set()
+            return True
+
+        mgr._flush_session = capture
+        mgr.save(sess, context=context)
+
+        assert flushed.wait(timeout=10), "async writer never flushed"
+        assert received == [(sess, context)]
 
     def test_shutdown_sentinel_stops_loop(self, make_manager):
         mgr = make_manager(write_frequency="async")
@@ -335,7 +376,7 @@ class TestAsyncWriterThread:
             mgr._cache[sess.key] = sess
 
         flushed = []
-        mgr._flush_session = lambda session: flushed.append(session) or True
+        mgr._flush_session = lambda session, *, context=None: flushed.append(session) or True
 
         thread = mgr._async_thread
         mgr.stop_async_writer()
@@ -363,7 +404,7 @@ class TestAsyncWriterRetry:
         call_count = [0]
         retry_done = threading.Event()
 
-        def flaky_flush(session):
+        def flaky_flush(session, *, context=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise ConnectionError("network blip")
@@ -388,7 +429,7 @@ class TestAsyncWriterRetry:
         call_count = [0]
         retry_done = threading.Event()
 
-        def always_fail(session):
+        def always_fail(session, *, context=None):
             call_count[0] += 1
             if call_count[0] >= 2:
                 retry_done.set()
@@ -414,7 +455,7 @@ class TestAsyncWriterRetry:
         call_count = [0]
         retry_done = threading.Event()
 
-        def fail_then_succeed(session):
+        def fail_then_succeed(session, *, context=None):
             call_count[0] += 1
             if call_count[0] >= 2:
                 retry_done.set()
@@ -441,7 +482,30 @@ def _prime_migration_session(mgr, key, honcho_session_id, ai_peer_id="custom-ai"
         honcho_session_id=honcho_session_id,
     )
     mgr._cache[session.key] = session
-    honcho_session = MagicMock()
+    honcho_session = Session(session.honcho_session_id, mgr.honcho)
+    upload = MagicMock()
+
+    def upload_file(*, file, peer, metadata):
+        upload(file=file, peer=peer, metadata=metadata)
+        return [
+            Message.from_api_response(
+                MessageResponse.model_validate(
+                    {
+                        "id": f"upload-{upload.call_count}",
+                        "content": file[1].decode("utf-8"),
+                        "peer_id": peer.id,
+                        "session_id": session.honcho_session_id,
+                        "workspace_id": "workspace-synthetic",
+                        "metadata": metadata,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "token_count": 1,
+                    }
+                )
+            )
+        ]
+
+    object.__setattr__(honcho_session, "upload_file", upload_file)
+    object.__setattr__(honcho_session, "upload_mock", upload)
     mgr._sessions_cache[session.honcho_session_id] = honcho_session
     return session, honcho_session
 
@@ -454,8 +518,8 @@ class TestMemoryFileMigrationTargets:
         session, honcho_session = _prime_migration_session(mgr, "cli:test", "cli-test")
         assert session.user_peer_id == "custom-user"
 
-        user_peer = MagicMock(name="user-peer")
-        ai_peer = MagicMock(name="ai-peer")
+        user_peer = Peer(session.user_peer_id, mgr.honcho)
+        ai_peer = Peer(session.assistant_peer_id, mgr.honcho)
         mgr._peers_cache[session.user_peer_id] = user_peer
         mgr._peers_cache[session.assistant_peer_id] = ai_peer
 
@@ -466,10 +530,10 @@ class TestMemoryFileMigrationTargets:
         uploaded = mgr.migrate_memory_files(session.key, str(tmp_path))
 
         assert uploaded is True
-        assert honcho_session.upload_file.call_count == 3
+        assert honcho_session.upload_mock.call_count == 3
 
         peer_by_upload_name = {}
-        for call_args in honcho_session.upload_file.call_args_list:
+        for call_args in honcho_session.upload_mock.call_args_list:
             payload = call_args.kwargs["file"]
             peer_by_upload_name[payload[0]] = call_args.kwargs["peer"]
 
@@ -498,7 +562,7 @@ class TestMemoryFileMigrationOwnerGate:
         uploaded = mgr.migrate_memory_files(session.key, str(tmp_path))
 
         assert uploaded is False
-        assert honcho_session.upload_file.call_count == 0
+        assert honcho_session.upload_mock.call_count == 0
 
     def test_no_declared_owner_with_gateway_identity_is_skipped(
             self, tmp_path, make_manager):
@@ -517,22 +581,24 @@ class TestMemoryFileMigrationOwnerGate:
         uploaded = mgr.migrate_memory_files(session.key, str(tmp_path))
 
         assert uploaded is False
-        assert honcho_session.upload_file.call_count == 0
+        assert honcho_session.upload_mock.call_count == 0
 
     def test_no_declared_owner_single_operator_migrates(self, tmp_path, make_manager):
         """No peerName and no runtime identity is the plain CLI install —
         the only person who exists is the operator the files describe."""
         mgr = make_manager(write_frequency="turn")
         session, honcho_session = _prime_migration_session(mgr, "cli:test", "cli-test")
-        mgr._peers_cache[session.user_peer_id] = MagicMock()
-        mgr._peers_cache[session.assistant_peer_id] = MagicMock()
+        mgr._peers_cache[session.user_peer_id] = Peer(session.user_peer_id, mgr.honcho)
+        mgr._peers_cache[session.assistant_peer_id] = Peer(
+            session.assistant_peer_id, mgr.honcho
+        )
 
         (tmp_path / "MEMORY.md").write_text("memory facts", encoding="utf-8")
 
         uploaded = mgr.migrate_memory_files(session.key, str(tmp_path))
 
         assert uploaded is True
-        assert honcho_session.upload_file.call_count == 1
+        assert honcho_session.upload_mock.call_count == 1
 
     def test_aliased_owner_identity_migrates(self, tmp_path, make_manager):
         """An alias mapping the owner's platform ID onto peerName makes that
@@ -547,15 +613,17 @@ class TestMemoryFileMigrationOwnerGate:
             mgr, "discord:dm", "discord-dm"
         )
         assert session.user_peer_id == "owner-user"
-        mgr._peers_cache[session.user_peer_id] = MagicMock()
-        mgr._peers_cache[session.assistant_peer_id] = MagicMock()
+        mgr._peers_cache[session.user_peer_id] = Peer(session.user_peer_id, mgr.honcho)
+        mgr._peers_cache[session.assistant_peer_id] = Peer(
+            session.assistant_peer_id, mgr.honcho
+        )
 
         (tmp_path / "USER.md").write_text("user profile", encoding="utf-8")
 
         uploaded = mgr.migrate_memory_files(session.key, str(tmp_path))
 
         assert uploaded is True
-        assert honcho_session.upload_file.call_count == 1
+        assert honcho_session.upload_mock.call_count == 1
 
     def test_pinned_peer_name_migrates(self, tmp_path, make_manager):
         """pinPeerName collapses every identity onto the owner peer by
@@ -570,15 +638,17 @@ class TestMemoryFileMigrationOwnerGate:
             mgr, "discord:shared", "shared-chan"
         )
         assert session.user_peer_id == "owner-user"
-        mgr._peers_cache[session.user_peer_id] = MagicMock()
-        mgr._peers_cache[session.assistant_peer_id] = MagicMock()
+        mgr._peers_cache[session.user_peer_id] = Peer(session.user_peer_id, mgr.honcho)
+        mgr._peers_cache[session.assistant_peer_id] = Peer(
+            session.assistant_peer_id, mgr.honcho
+        )
 
         (tmp_path / "MEMORY.md").write_text("memory facts", encoding="utf-8")
 
         uploaded = mgr.migrate_memory_files(session.key, str(tmp_path))
 
         assert uploaded is True
-        assert honcho_session.upload_file.call_count == 1
+        assert honcho_session.upload_mock.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -595,9 +665,38 @@ class TestPrefetchCacheAccessors:
     def test_set_and_pop_context_result(self, make_manager):
         mgr = make_manager(write_frequency="turn")
         payload = {"representation": "Known user", "card": "prefers concise replies"}
+        session = _make_session()
+        mgr._cache[session.key] = session
+        context = ProviderTurnContext.create(
+            turn=1,
+            generation=1,
+            workspace="workspace-synthetic",
+            session=session.honcho_session_id,
+            user_peer=session.user_peer_id,
+            ai_peer=session.assistant_peer_id,
+            deadline=10_000.0,
+            total_cap=4,
+            monotonic=lambda: 0.0,
+        )
 
-        mgr.set_context_result("cli:test", payload)
+        mgr.set_context_result(
+            session.key,
+            payload,
+            context=context,
+            peer_id=session.user_peer_id,
+            source="prefetch",
+        )
 
-        assert mgr.pop_context_result("cli:test") == payload
-        assert mgr.pop_context_result("cli:test") == {}
+        assert mgr.pop_context_result(
+            session.key,
+            context=context,
+            peer_id=session.user_peer_id,
+            source="prefetch",
+        ) == payload
+        assert mgr.pop_context_result(
+            session.key,
+            context=context,
+            peer_id=session.user_peer_id,
+            source="prefetch",
+        ) == {}
 

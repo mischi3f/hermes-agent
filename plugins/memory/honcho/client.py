@@ -18,6 +18,7 @@ import os
 import logging
 import hashlib
 import ipaddress
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -264,6 +265,203 @@ def _parse_dialectic_depth_levels(host_val, root_val, depth: int) -> list[str] |
 # the Honcho backend is unreachable, preventing the gateway from
 # delivering the already-generated response.
 _DEFAULT_HTTP_TIMEOUT = 30.0
+
+
+# Test-only seam. When set, ``_build`` passes the produced ``httpx.Client``
+# (typically backed by ``httpx.MockTransport``) straight to the real Honcho
+# SDK constructor, so lifecycle tests exercise genuine SDK
+# construction/serialization/retry code with no sockets and no method
+# monkeypatching. Never set outside tests; ``_reset_client_registry_for_tests``
+# clears it and the network-isolation conftest fails any leaked real socket.
+_http_client_factory_for_tests: Any = None
+
+
+def set_http_client_factory_for_tests(factory: Any) -> None:
+    """Install (or clear, with ``None``) the SDK ``http_client`` factory."""
+    global _http_client_factory_for_tests
+    _http_client_factory_for_tests = factory
+
+
+class _AccountingTransport:
+    """Charge one unit per real HTTP attempt and hold every attempt to the
+    bound context's one absolute monotonic deadline.
+
+    Wraps the SDK's *actual* httpx transport (loopback in prod, an injected
+    ``httpx.MockTransport`` in tests).  It runs once immediately before every
+    request the SDK issues -- the first attempt, any nested get-or-create
+    fan-out, and each pass of the SDK's own retry loop -- and:
+
+    * **rejects an already-expired context before the token and the wire.**
+      ``remaining = deadline - monotonic()`` is computed first; if it is not
+      positive the request raises ``HonchoTurnBudgetExceeded`` before any
+      transport token is charged and before the inner transport runs, so an
+      expired turn issues zero wire calls and starts no retry or fan-out.
+    * **charges exactly one transport token per request that reaches the
+      wire**, whatever its outcome.  Wrapper-level accounting alone (one
+      ``ledger.consume`` per ``_authed_call``) cannot see the SDK's nested
+      fan-out or retry loop and would let a storm escape the per-turn cap.
+    * **clamps this one request's ``timeout`` extension down to
+      ``remaining``.**  httpx builds a fresh ``Request.extensions`` dict per
+      call, so lowering its ``timeout`` facets bounds only this request; the
+      shared client's ``timeout`` is never mutated and concurrent prefetch
+      workers are unaffected.  A genuine socket transport (httpcore) then
+      stops waiting at the deadline.
+    * **after the inner transport returns, re-checks the deadline** and, if
+      it passed while the request was in flight, closes and discards the
+      response and raises, so no stale body is handed back and the SDK's
+      retry loop / the wrapper's post-401 auth retry see an expired context
+      and stop.
+
+    Hard-cancellation limitation: a synchronous custom transport that ignores
+    the ``timeout`` extension (``httpx.MockTransport``, any blocking test
+    double, a transport running its own I/O) cannot be interrupted from here.
+    ``handle_request`` is a plain blocking call with no cancellation
+    interface in httpx 0.28 / honcho-ai 2.2.0.  For those transports the
+    guarantee is pre-wire rejection plus post-return discard with no
+    follow-up, not an in-flight abort.
+
+    An unbound thread (no active turn/operation) passes straight through.
+    """
+
+    #: ``Request.extensions['timeout']`` facets httpx/httpcore honour per request.
+    _TIMEOUT_KEYS = ("connect", "read", "write", "pool")
+
+    def __init__(self, inner: Any, *, monotonic: Any = None) -> None:
+        self._inner = inner
+        # Narrow injectable clock.  ``None`` -> use the bound context's own
+        # ``monotonic`` (so a context created with an injected fake clock in a
+        # test drives this seam too), falling back to ``time.monotonic`` in
+        # production.  ``_install_transport_accounting`` never passes one.
+        self._monotonic = monotonic
+
+    def _clock(self, context: Any) -> Any:
+        if self._monotonic is not None:
+            return self._monotonic
+        ctx_clock = getattr(context, "_monotonic", None)
+        return ctx_clock if callable(ctx_clock) else time.monotonic
+
+    @classmethod
+    def _clamp_timeout_extension(cls, request: Any, remaining: float) -> None:
+        """Hold *this* request's wire timeout to ``remaining`` seconds.
+
+        Only lowers each timeout facet and only touches the per-request
+        ``extensions`` dict, so a longer ambient client timeout still caps
+        the request while the shared client stays untouched.
+        """
+        extensions = getattr(request, "extensions", None)
+        if not isinstance(extensions, dict):
+            return
+        bound = remaining if remaining > 0 else 0.0
+        current = extensions.get("timeout")
+        if isinstance(current, dict):
+            extensions["timeout"] = {
+                key: (bound if value is None else min(float(value), bound))
+                for key, value in current.items()
+            }
+        else:
+            extensions["timeout"] = {key: bound for key in cls._TIMEOUT_KEYS}
+
+    @staticmethod
+    def _discard_response(response: Any) -> None:
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("Honcho late-response discard close failed", exc_info=True)
+
+    def handle_request(self, request: Any) -> Any:
+        from plugins.memory.honcho.turn_context import (
+            HonchoTurnBudgetExceeded,
+            current_transport_context,
+        )
+
+        context = current_transport_context()
+        if context is None:
+            return self._inner.handle_request(request)
+
+        clock = self._clock(context)
+        deadline = getattr(context, "deadline", None)
+        has_deadline = isinstance(deadline, (int, float)) and not isinstance(
+            deadline, bool
+        )
+
+        # 1. Reject an already-expired context before the token and the wire.
+        remaining: float | None = None
+        if has_deadline:
+            remaining = float(deadline) - clock()
+            expired = remaining <= 0
+        else:
+            expired = bool(getattr(context, "expired", False))
+        if expired:
+            raise HonchoTurnBudgetExceeded(
+                "Honcho turn deadline exceeded before HTTP transport attempt"
+            )
+
+        # 2. Exactly one transport token per request that reaches the wire.
+        ledger = getattr(context, "ledger", None)
+        if ledger is not None and not ledger.charge_transport():
+            raise HonchoTurnBudgetExceeded(
+                "Honcho turn HTTP transport-attempt budget exhausted"
+            )
+
+        # 3. Bound this one request's wire wait to the time left (best effort;
+        #    a transport that ignores the timeout extension is caught by 5).
+        if remaining is not None:
+            self._clamp_timeout_extension(request, remaining)
+
+        # 4. Run the real transport.  It cannot be force-cancelled from here.
+        response = self._inner.handle_request(request)
+
+        # 5. Discard a result that landed after the deadline and raise, so no
+        #    retry / auth retry / fan-out follow-up runs under an expired
+        #    context.
+        if has_deadline and clock() >= float(deadline):
+            self._discard_response(response)
+            raise HonchoTurnBudgetExceeded(
+                "Honcho turn deadline exceeded during HTTP transport attempt"
+            )
+        return response
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+def _install_transport_accounting(client: object) -> None:
+    """Wrap the SDK client's real httpx transport with ``_AccountingTransport``.
+
+    Idempotent and non-fatal: a private-attribute shape change disables
+    transport accounting (the wrapper-level ledger still bounds each
+    ``_authed_call``) rather than breaking client construction.
+    """
+    try:
+        http = getattr(client, "_http", None)
+        inner_client = getattr(http, "_client", None)
+        if inner_client is None:
+            return
+        current = getattr(inner_client, "_transport", None)
+        if current is not None and not isinstance(current, _AccountingTransport):
+            inner_client._transport = _AccountingTransport(current)
+        mounts = getattr(inner_client, "_mounts", None)
+        if isinstance(mounts, dict) and mounts:
+            inner_client._mounts = {
+                pattern: (
+                    mounted
+                    if mounted is None or isinstance(mounted, _AccountingTransport)
+                    else _AccountingTransport(mounted)
+                )
+                for pattern, mounted in mounts.items()
+            }
+    except Exception:
+        logger.debug("Honcho transport accounting not installed", exc_info=True)
 
 
 def _is_local_base_url(base_url: str | None) -> bool:
@@ -975,12 +1173,12 @@ _client_blocked_keys: set[tuple] = set()
 class HonchoClientLease:
     """One explicit use lease for an exact client generation."""
 
-    __slots__ = ("_record", "_released", "_legacy")
+    __slots__ = ("_record", "_released", "_external")
 
-    def __init__(self, record: _ClientGeneration, *, legacy: bool = False):
+    def __init__(self, record: _ClientGeneration, *, external: bool = False):
         self._record = record
         self._released = False
-        self._legacy = legacy
+        self._external = external
 
     @property
     def client(self):
@@ -991,7 +1189,7 @@ class HonchoClientLease:
             if self._released or self._record.state in {"closing", "closed"}:
                 raise RuntimeError("Honcho client generation is unavailable")
             self._record.active_leases += 1
-            return HonchoClientLease(self._record, legacy=self._legacy)
+            return HonchoClientLease(self._record, external=self._external)
 
     def release(self) -> bool:
         return _release_client_lease(self, retire=False)
@@ -1258,6 +1456,8 @@ def _reset_client_registry_for_tests() -> None:
         _pending_generation_closes.clear()
         _client_blocked_keys.clear()
     _honcho_client_slot.reset()
+    global _http_client_factory_for_tests
+    _http_client_factory_for_tests = None
 
 
 def _slot_for_locked(key: tuple) -> SingletonSlot:
@@ -1559,7 +1759,17 @@ def get_honcho_client(
         if resolved_timeout is not None:
             kwargs["timeout"] = resolved_timeout
 
-        return Honcho(**kwargs)
+        factory = _http_client_factory_for_tests
+        if factory is not None:
+            # Real SDK, synthetic transport: no method is patched, only the
+            # socket layer is replaced.
+            kwargs["http_client"] = factory()
+
+        built = Honcho(**kwargs)
+        # Charge every real HTTP attempt (prod loopback or injected mock alike)
+        # to the bound turn/operation ledger.
+        _install_transport_accounting(built)
+        return built
 
     with _client_slots_lock:
         if key in _client_blocked_keys:
@@ -1612,7 +1822,7 @@ def lease_existing_honcho_client(
         slot = _client_slots.get(key) or SingletonSlot()
         record = _register_generation_locked(key, client, slot)
         record.active_leases += 1
-        return HonchoClientLease(record, legacy=True)
+        return HonchoClientLease(record, external=True)
 
 
 def close_honcho_client(

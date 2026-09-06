@@ -33,8 +33,16 @@ class TestConstructorRace:
         """Regression 1: fake factory installed BEFORE the constructor receives
         every flush; no real transport is ever touched (network guard active)."""
         fake = MagicMock()
+        # Give the injected fake an authenticated-workspace identity that matches
+        # the configured scope, so strict workspace-scope proof passes on the
+        # fake alone (no real transport) rather than failing closed before the
+        # flush reaches ``fake.method_calls``.
+        fake.workspace_id = "isolation-ws"
         monkeypatch.setattr(session_module, "get_honcho_client", lambda *a, **k: fake)
-        cfg = HonchoClientConfig(write_frequency="async", api_key="test-key", enabled=True)
+        cfg = HonchoClientConfig(
+            write_frequency="async", api_key="test-key", enabled=True,
+            workspace_id="isolation-ws",
+        )
         mgr = HonchoSessionManager(honcho=fake, config=cfg)
         try:
             sess = _session()

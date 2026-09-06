@@ -7,10 +7,17 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from honcho.api_types import ConclusionResponse, MessageResponse
+from honcho.conclusions import Conclusion, ConclusionScope
+from honcho.message import Message
+from honcho.peer import Peer
+
+from plugins.memory.honcho.client import HonchoClientConfig
 from plugins.memory.honcho.session import (
     HonchoSession,
     HonchoSessionManager,
 )
+from plugins.memory.honcho.turn_context import ProviderTurnContext
 from plugins.memory.honcho import HonchoMemoryProvider
 
 
@@ -136,7 +143,9 @@ class TestManagerCacheOps:
 
 class TestPeerLookupHelpers:
     def _make_cached_manager(self):
-        mgr = HonchoSessionManager()
+        cfg = HonchoClientConfig(workspace_id="workspace-synthetic", enabled=True)
+        client = SimpleNamespace(workspace_id="workspace-synthetic")
+        mgr = HonchoSessionManager(honcho=client, config=cfg)
         session = HonchoSession(
             key="telegram:123",
             user_peer_id="robert",
@@ -151,22 +160,50 @@ class TestPeerLookupHelpers:
         # Writes must go to the same observer-target slot that reads check,
         # so that a subsequent honcho_profile read returns what was written.
         mgr, session = self._make_cached_manager()
-        assistant_peer = MagicMock()
-        assistant_peer.set_card.return_value = ["Role: user"]
+        assistant_peer = Peer(session.assistant_peer_id, mgr.honcho)
+        set_card = MagicMock(return_value=["Role: user"])
+        object.__setattr__(assistant_peer, "set_card", set_card)
         mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
 
         result = mgr.set_peer_card(session.key, ["Role: user"])
 
         assert result == ["Role: user"]
-        assistant_peer.set_card.assert_called_once_with(["Role: user"], target=session.user_peer_id)
+        set_card.assert_called_once_with(["Role: user"], target=session.user_peer_id)
 
     def test_search_context_uses_peer_perspective_message_search(self):
         """Search spans the target peer's sessions instead of its representation."""
         mgr, session = self._make_cached_manager()
         honcho_client = MagicMock()
+        honcho_client.workspace_id = "workspace-synthetic"
         honcho_client.search.return_value = [
-            SimpleNamespace(content="Robert runs neuralancer", peer_id="hermes", session_id="s-old", id="m1"),
-            SimpleNamespace(content="I founded neuralancer in 2019", peer_id="robert", session_id="s-old", id="m2"),
+            Message.from_api_response(
+                MessageResponse.model_validate(
+                    {
+                        "id": "m1",
+                        "content": "Robert runs neuralancer",
+                        "peer_id": "hermes",
+                        "session_id": session.honcho_session_id,
+                        "workspace_id": "workspace-synthetic",
+                        "metadata": {},
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "token_count": 1,
+                    }
+                )
+            ),
+            Message.from_api_response(
+                MessageResponse.model_validate(
+                    {
+                        "id": "m2",
+                        "content": "I founded neuralancer in 2019",
+                        "peer_id": "robert",
+                        "session_id": session.honcho_session_id,
+                        "workspace_id": "workspace-synthetic",
+                        "metadata": {},
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "token_count": 1,
+                    }
+                )
+            ),
         ]
         with patch.object(HonchoSessionManager, "honcho", new_callable=lambda: property(lambda s: honcho_client)):
             result = mgr.search_context(session.key, "neuralancer")
@@ -185,16 +222,40 @@ class TestPeerLookupHelpers:
 
     def test_create_conclusion_defaults_to_user_target(self):
         mgr, session = self._make_cached_manager()
-        assistant_peer = MagicMock()
-        scope = MagicMock()
-        assistant_peer.conclusions_of.return_value = scope
+        assistant_peer = Peer(session.assistant_peer_id, mgr.honcho)
+        scope = ConclusionScope(
+            mgr.honcho,
+            "workspace-synthetic",
+            session.assistant_peer_id,
+            session.user_peer_id,
+        )
+        created = MagicMock(
+            return_value=[
+                Conclusion.from_api_response(
+                    ConclusionResponse.model_validate(
+                        {
+                            "id": "conclusion-1",
+                            "content": "User prefers dark mode",
+                            "observer_id": session.assistant_peer_id,
+                            "observed_id": session.user_peer_id,
+                            "session_id": session.honcho_session_id,
+                            "level": "explicit",
+                            "created_at": "2026-01-01T00:00:00Z",
+                        }
+                    )
+                )
+            ]
+        )
+        object.__setattr__(scope, "create", created)
+        conclusions_of = MagicMock(return_value=scope)
+        object.__setattr__(assistant_peer, "conclusions_of", conclusions_of)
         mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
 
         ok = mgr.create_conclusion(session.key, "User prefers dark mode")
 
         assert ok is True
-        assistant_peer.conclusions_of.assert_called_once_with(session.user_peer_id)
-        scope.create.assert_called_once_with([{
+        conclusions_of.assert_called_once_with(session.user_peer_id)
+        created.assert_called_once_with([{
             "content": "User prefers dark mode",
             "session_id": session.honcho_session_id,
         }])
@@ -227,11 +288,11 @@ class TestConcludeToolDispatch:
         )
 
         assert "Conclusion saved for user" in result
-        provider._manager.create_conclusion.assert_called_once_with(
-            "telegram:123",
-            "User prefers dark mode",
-            peer="user",
-        )
+        provider._manager.create_conclusion.assert_called_once()
+        call_args, call_kwargs = provider._manager.create_conclusion.call_args
+        assert call_args == ("telegram:123", "User prefers dark mode")
+        assert call_kwargs["peer"] == "user"
+        assert call_kwargs["context"].operation == "tool operation"
 
 
     def test_sync_turn_strips_leaked_memory_context_before_honcho_ingest(self):
@@ -458,8 +519,12 @@ class TestDialecticInputGuard:
         """Queries exceeding dialectic_max_input_chars are truncated."""
         from plugins.memory.honcho.client import HonchoClientConfig
 
-        cfg = HonchoClientConfig(dialectic_max_input_chars=100)
-        mgr = HonchoSessionManager(config=cfg)
+        cfg = HonchoClientConfig(
+            workspace_id="workspace-synthetic", dialectic_max_input_chars=100,
+        )
+        mgr = HonchoSessionManager(
+            honcho=SimpleNamespace(workspace_id="workspace-synthetic"), config=cfg,
+        )
         mgr._dialectic_max_input_chars = 100
 
         # Create a cached session so dialectic_query doesn't bail early
@@ -488,8 +553,10 @@ class TestDialecticInjectionCap:
     def _manager_with_long_answer(self, answer):
         from plugins.memory.honcho.client import HonchoClientConfig
 
-        cfg = HonchoClientConfig(dialectic_max_chars=50)
-        mgr = HonchoSessionManager(config=cfg)
+        cfg = HonchoClientConfig(workspace_id="workspace-synthetic", dialectic_max_chars=50)
+        mgr = HonchoSessionManager(
+            honcho=SimpleNamespace(workspace_id="workspace-synthetic"), config=cfg,
+        )
         mgr._dialectic_max_chars = 50
 
         session = HonchoSession(
@@ -498,8 +565,9 @@ class TestDialecticInjectionCap:
         )
         mgr._cache["test"] = session
 
-        mock_peer = MagicMock()
-        mock_peer.chat.return_value = answer
+        mock_peer = Peer(session.assistant_peer_id, mgr.honcho)
+        chat = MagicMock(return_value=answer)
+        object.__setattr__(mock_peer, "chat", chat)
         mgr._get_or_create_peer = MagicMock(return_value=mock_peer)
         return mgr
 
@@ -627,11 +695,19 @@ class TestBaseContextSummary:
 
         manager.get_prefetch_context.side_effect = get_context
         manager.set_context_result.side_effect = (
-            lambda session_key, result: cached.__setitem__(session_key, result)
+            lambda session_key, result, **kwargs: cached.__setitem__(session_key, result)
         )
         manager.pop_context_result.side_effect = (
-            lambda session_key: cached.pop(session_key, {})
+            lambda session_key, **kwargs: cached.pop(session_key, {})
         )
+        manager._cache = {
+            "test": HonchoSession(
+                key="test",
+                user_peer_id="user-synthetic",
+                assistant_peer_id="assistant-synthetic",
+                honcho_session_id="session-synthetic",
+            )
+        }
 
         provider = HonchoMemoryProvider()
         provider._manager = manager
@@ -641,6 +717,16 @@ class TestBaseContextSummary:
         provider._recall_mode = "context"
         provider._turn_count = 1
         provider._last_dialectic_turn = 0
+        provider._turn_context = ProviderTurnContext.create(
+            turn=1,
+            generation=1,
+            workspace="workspace-synthetic",
+            session="session-synthetic",
+            user_peer="user-synthetic",
+            ai_peer="assistant-synthetic",
+            deadline=time.monotonic() + 5,
+            total_cap=8,
+        )
 
         assert provider.prefetch("first question") == ""
         ready.set()
@@ -1340,11 +1426,12 @@ class TestGetSessionContextFallback:
         from plugins.memory.honcho.client import HonchoClientConfig
         from plugins.memory.honcho.session import HonchoSessionManager
 
-        cfg = HonchoClientConfig(api_key="test-key", enabled=True)
-        mgr = HonchoSessionManager.__new__(HonchoSessionManager)
-        mgr._cache = {}
-        mgr._sessions_cache = {}
-        mgr._config = cfg
+        cfg = HonchoClientConfig(
+            api_key="test-key", workspace_id="hermes", enabled=True
+        )
+        mgr = HonchoSessionManager(
+            honcho=SimpleNamespace(workspace_id="hermes"), config=cfg
+        )
         mgr._dialectic_dynamic = True
         mgr._dialectic_reasoning_level = "low"
         mgr._dialectic_max_input_chars = 10000
@@ -1365,8 +1452,12 @@ class TestGetSessionContextFallback:
         mgr = self._make_manager_with_session()
         fetch_calls = []
 
-        def _fake_fetch(peer_id, search_query=None, *, target=None):
+        def _fake_fetch(
+            session, peer_id, search_query=None, *, target=None, context=None
+        ):
+            assert session is mgr._cache["test"]
             fetch_calls.append((peer_id, target))
+            assert context is not None
             return {"representation": "user rep", "card": []}
 
         mgr._fetch_peer_context = _fake_fetch
