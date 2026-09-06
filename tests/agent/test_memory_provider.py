@@ -1464,3 +1464,27 @@ class TestSystemPromptGateParity:
         assert added == 1
         names = {t["function"]["name"] for t in agent.tools}
         assert "mnemosyne_remember" in names
+
+    def test_web_and_memory_keep_context_mode_prompt_without_provider_tools(self):
+        """Context-only providers keep automatic prompt injection read-only."""
+        from agent.memory_manager import (
+            inject_memory_provider_tools,
+            memory_provider_tools_exposed,
+        )
+
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("honcho", tools=[])
+        provider._prompt_block = "HONCHO_CONTEXT_BLOCK"
+        mgr.add_provider(provider)
+        agent = SimpleNamespace(
+            _memory_manager=mgr,
+            enabled_toolsets=["web", "memory"],
+            disabled_toolsets=None,
+            tools=[],
+            valid_tool_names=set(),
+        )
+
+        assert memory_provider_tools_exposed(agent) is True
+        assert inject_memory_provider_tools(agent) == 0
+        assert agent.tools == []
+        assert mgr.build_system_prompt() == "HONCHO_CONTEXT_BLOCK"

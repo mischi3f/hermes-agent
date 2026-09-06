@@ -526,6 +526,21 @@ class TestMemoryProviderSystemPromptGating:
                       enabled_toolsets=["memory"], disabled_toolsets=None)
         assert block in full
 
+    def test_block_injected_with_web_and_memory_toolsets(self):
+        block = "PROVIDER_BLOCK_SENTINEL"
+        agent = self._agent(
+            enabled_toolsets=["web", "memory"],
+            disabled_toolsets=None,
+            prompt_block=block,
+        )
+        full = _build(
+            build_system_prompt,
+            _memory_manager=agent._memory_manager,
+            enabled_toolsets=["web", "memory"],
+            disabled_toolsets=None,
+        )
+        assert block in full
+
     def test_block_dropped_when_memory_toolset_disabled(self):
         block = "PROVIDER_BLOCK_SENTINEL"
         agent = self._agent(

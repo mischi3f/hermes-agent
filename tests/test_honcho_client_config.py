@@ -112,6 +112,65 @@ class TestLatencyFlagResolution:
         assert cfg.first_turn_base_wait == 0.0
         assert cfg.first_turn_dialectic_wait == 0.5
 
+
+class TestRecallModeResolution:
+    """Honcho recall mode supports a safe process-local override."""
+
+    @staticmethod
+    def _config(tmp_path, *, root=None, host=None):
+        data = {"apiKey": "synthetic-key"}
+        if root is not None:
+            data["recallMode"] = root
+        if host is not None:
+            data["hosts"] = {"hermes": {"recallMode": host}}
+        path = tmp_path / "honcho.json"
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_without_override_preserves_host_then_root_precedence(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HONCHO_RECALL_MODE", raising=False)
+        cfg = HonchoClientConfig.from_global_config(
+            config_path=self._config(tmp_path, root="tools", host="context")
+        )
+        assert cfg.recall_mode == "context"
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        (("context", "context"), ("hybrid", "hybrid"), ("tools", "tools"), ("auto", "hybrid")),
+    )
+    def test_valid_process_override_wins(self, tmp_path, monkeypatch, value, expected):
+        monkeypatch.setenv("HONCHO_RECALL_MODE", value)
+        cfg = HonchoClientConfig.from_global_config(
+            config_path=self._config(tmp_path, root="tools", host="hybrid")
+        )
+        assert cfg.recall_mode == expected
+
+    @pytest.mark.parametrize("value", ("", "unsupported"))
+    def test_empty_or_invalid_process_override_does_not_override_file_config(
+        self, tmp_path, monkeypatch, value
+    ):
+        monkeypatch.setenv("HONCHO_RECALL_MODE", value)
+        cfg = HonchoClientConfig.from_global_config(
+            config_path=self._config(tmp_path, root="tools", host="context")
+        )
+        assert cfg.recall_mode == "context"
+
+    def test_context_mode_has_no_callable_honcho_tools(self):
+        provider = HonchoMemoryProvider()
+        provider._recall_mode = "context"
+        assert provider.get_tool_schemas() == []
+
+    def test_from_env_honors_valid_process_override_without_config_file(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HONCHO_RECALL_MODE", "context")
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.resolve_config_path",
+            lambda: tmp_path / "missing-honcho.json",
+        )
+        cfg = HonchoClientConfig.from_global_config()
+        assert cfg.recall_mode == "context"
+
     def test_per_host_timeout_wins_over_global(self, tmp_path, monkeypatch):
         monkeypatch.delenv('HONCHO_TIMEOUT', raising=False)
         config_path = tmp_path / 'config.json'

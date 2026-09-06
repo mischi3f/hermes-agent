@@ -150,6 +150,25 @@ def _normalize_recall_mode(val: str) -> str:
     return val if val in _VALID_RECALL_MODES else "hybrid"
 
 
+def _resolve_recall_mode(host_value: object, root_value: object) -> str:
+    """Resolve recall mode, allowing a valid process-local override.
+
+    ``HONCHO_RECALL_MODE`` is intentionally accepted only when it names a
+    supported mode (including the legacy ``auto`` alias). Empty or invalid
+    values do not override file configuration; file values retain the existing
+    invalid-value fallback to ``hybrid``.
+    """
+    override = os.environ.get("HONCHO_RECALL_MODE", "").strip()
+    if override:
+        normalized_override = _RECALL_MODE_ALIASES.get(override, override)
+        if normalized_override in _VALID_RECALL_MODES:
+            return _normalize_recall_mode(override)
+        logger.warning(
+            "Ignoring invalid HONCHO_RECALL_MODE value; using Honcho config"
+        )
+    return _normalize_recall_mode(host_value or root_value or "hybrid")
+
+
 def _resolve_bool(*vals, default: bool) -> bool:
     """Resolve a bool config field: first non-None wins, else default.
 
@@ -728,6 +747,7 @@ class HonchoClientConfig:
             timeout=timeout,
             ai_peer=resolved_host,
             enabled=bool(api_key or base_url),
+            recall_mode=_resolve_recall_mode(None, None),
             config_path=_resolved_path,
             hermes_home=get_hermes_home(),
         )
@@ -949,10 +969,9 @@ class HonchoClientConfig:
                 raw.get("dialecticMaxInputChars"),
                 default=10000,
             ),
-            recall_mode=_normalize_recall_mode(
-                host_block.get("recallMode")
-                or raw.get("recallMode")
-                or "hybrid"
+            recall_mode=_resolve_recall_mode(
+                host_block.get("recallMode"),
+                raw.get("recallMode"),
             ),
             init_on_session_start=_resolve_bool(
                 host_block.get("initOnSessionStart"),
