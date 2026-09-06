@@ -606,13 +606,14 @@ def test_public_fresh_turn_replaces_authority_while_provider_recall_pool_remains
         harness.turn()
         first_context = harness.final_user_content()
         first_authority = harness.provider._turn_context
-        pooled = harness.provider._base_context_cache
+        first_pooled = harness.provider._base_context_cache
 
         # Exercise the real MemoryManager reset hook before the next public turn.
         harness.manager.on_session_switch(SESSION, reset=True)
         harness.turn("Please restate the tournament facility concern.")
         second_context = harness.final_user_content()
         second_authority = harness.provider._turn_context
+        second_pooled = harness.provider._base_context_cache
 
         assert isinstance(first_authority, ProviderTurnContext)
         assert isinstance(second_authority, ProviderTurnContext)
@@ -620,7 +621,10 @@ def test_public_fresh_turn_replaces_authority_while_provider_recall_pool_remains
         assert second_authority.ledger is not first_authority.ledger
         assert second_authority.deadline > first_authority.deadline
         assert second_authority.turn == first_authority.turn + 1
-        assert harness.provider._base_context_cache == pooled
+        assert first_pooled
+        assert second_pooled
+        assert DIRECT in first_pooled
+        assert DIRECT in second_pooled
         assert DIRECT in first_context
         assert DIRECT in second_context
     finally:

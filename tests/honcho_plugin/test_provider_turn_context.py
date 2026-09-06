@@ -976,6 +976,11 @@ def test_identity_cli_reuses_one_operation_context_for_setup_and_seed(
         lambda cfg: SimpleNamespace(),
     )
     monkeypatch.setattr(
+        HonchoClientConfig,
+        "resolve_session_name",
+        lambda self, **kwargs: "honcho-provider-turn-context",
+    )
+    monkeypatch.setattr(
         "plugins.memory.honcho.session.HonchoSessionManager",
         MagicMock(return_value=manager),
     )
