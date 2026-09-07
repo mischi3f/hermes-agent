@@ -1126,11 +1126,26 @@ class HonchoMemoryProvider(MemoryProvider):
         # This matters for process-per-turn callers: unfinished work cannot be
         # surfaced by the next turn because the provider instance will exit.
         _dia_wait = 0.0
+        _dia_deadline = None
         if self._last_dialectic_turn == -999 and query:
             _dia_wait = self._FIRST_TURN_DIALECTIC_CAP
             request_timeout = getattr(self._config, "timeout", None)
             if request_timeout is not None:
                 _dia_wait = min(_dia_wait, max(0.0, request_timeout))
+            # The configured cold-start and dialectic waits are one combined
+            # startup envelope. If init/base work finishes early, preserve its
+            # unused share for the same-turn query rather than shortening the
+            # query window to ``elapsed base + dialectic cap``. This is critical
+            # for process-per-request callers because a later publication dies
+            # with the provider instance. The immutable turn deadline remains
+            # authoritative and can only shorten this envelope.
+            _dia_deadline = (
+                cold_start_deadline + _dia_wait
+                if cold_start_deadline is not None
+                else time.monotonic() + _dia_wait
+            )
+            if self._turn_context is not None:
+                _dia_deadline = min(_dia_deadline, self._turn_context.deadline)
             if not self._thread_is_live():
                 _fired_at = self._turn_count
                 dialectic_turn_context = self._turn_context
@@ -1320,17 +1335,22 @@ class HonchoMemoryProvider(MemoryProvider):
                 parts.append(base_context)
 
         # ----- Layer 2: Dialectic supplement -----
-        # The dialectic worker started before Layer 1 so it can use time spent
-        # waiting for base context. Its own join cap is unchanged.
+        # The dialectic worker started before Layer 1. Consume it within the
+        # unchanged combined cold-start + dialectic envelope calculated above.
         if self._last_dialectic_turn == -999 and query:
             _live = self._prefetch_thread
+            _dia_join_wait = (
+                max(0.0, _dia_deadline - time.monotonic())
+                if _dia_deadline is not None
+                else _dia_wait
+            )
             if _live is not None:
-                _live.join(timeout=_dia_wait)
+                _live.join(timeout=_dia_join_wait)
             if self._prefetch_thread and self._prefetch_thread.is_alive():
                 logger.debug(
                     "Honcho first-turn dialectic still running after %.1fs — "
                     "will surface on next turn",
-                    _dia_wait,
+                    _dia_join_wait,
                 )
 
         # Consume only results that are already ready; later turns never wait.

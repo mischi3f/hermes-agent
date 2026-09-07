@@ -5,7 +5,10 @@ prologue owned by ``agent.conversation_loop.run_conversation``.  The prologue
 calls the real ``MemoryManager.on_turn_start`` and ``prefetch_all`` methods;
 the manager and provider then use their production worker scheduling, the real
 ``honcho-ai==2.2.0`` SDK, and an ``httpx.MockTransport``.  No Honcho manager or
-provider method is replaced.
+provider method is replaced in the transport-boundary tests. The dedicated
+process-lifecycle timing regression substitutes only deterministic worker/clock
+objects while retaining the production schedule, run, publish, consume, render,
+and final request path.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ import httpx
 import pytest
 
 import run_agent
+import plugins.memory.honcho as honcho_module
 from agent.conversation_loop import run_conversation
 from agent.memory_manager import MemoryManager
 from plugins.memory.honcho import HonchoMemoryProvider
@@ -48,6 +52,38 @@ GENERATED = (
     "Pinewood Athletic Complex is associated with incomplete field-use paperwork."
 )
 DIRECT_PAPERWORK = "Pinewood Athletic Complex has incomplete field-use paperwork."
+GENERIC_BASE = "Current pooled Board context is available."
+
+
+class _PublicVirtualClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _PublicDelayedWorker:
+    """Deterministic worker used only to model process-local completion order."""
+
+    def __init__(self, target, *, clock: _PublicVirtualClock, delay: float) -> None:
+        self._target = target
+        self._clock = clock
+        self._ready_at = clock.monotonic() + delay
+        self._finished = False
+
+    def join(self, timeout=None) -> None:
+        if self._finished or timeout is None:
+            return
+        self._clock.now = min(
+            self._ready_at, self._clock.monotonic() + max(0.0, timeout)
+        )
+        if self._clock.monotonic() >= self._ready_at:
+            self._target()
+            self._finished = True
+
+    def is_alive(self) -> bool:
+        return not self._finished
 
 
 class PublicTurnTransport:
@@ -430,6 +466,97 @@ def test_public_turn_base_fallbacks_do_not_starve_query_dialectic(
         assert not any(
             call["method"] == "POST" and str(call["path"]).endswith("/messages")
             for call in transport.calls
+        )
+    finally:
+        harness.close()
+
+
+def test_public_cold_resumed_turn_consumes_query_result_before_final_request(
+    tmp_path, monkeypatch
+):
+    """A fresh resumed provider must not lose same-turn dialectic at process exit."""
+    monkeypatch.setenv("HONCHO_SAVE_MESSAGES", "false")
+    transport = PublicTurnTransport(chat_content=DIRECT)
+    harness = _start_harness(
+        tmp_path,
+        monkeypatch,
+        transport=transport,
+        config_overrides={
+            "firstTurnBaseWait": 3,
+            "firstTurnDialecticWait": 2,
+            "dialecticCadence": 2,
+        },
+    )
+    clock = _PublicVirtualClock()
+    workers = {}
+
+    prewarm = harness.provider._prewarm_thread
+    if prewarm is not None:
+        prewarm.join(timeout=5)
+
+    harness.provider._base_context_cache = GENERIC_BASE
+    harness.provider._session_initialized = False
+    init_worker = _PublicDelayedWorker(
+        lambda: setattr(harness.provider, "_session_initialized", True),
+        clock=clock,
+        delay=0.2,
+    )
+    harness.provider._init_thread = init_worker
+
+    def start_worker(target, *, name):
+        worker = _PublicDelayedWorker(target, clock=clock, delay=4.0)
+        workers[name] = worker
+        return worker
+
+    monkeypatch.setattr(harness.provider, "_start_owned_worker", start_worker)
+    monkeypatch.setattr(
+        harness.provider, "_start_session_init_background", lambda: None
+    )
+    monkeypatch.setattr(honcho_module.time, "monotonic", clock.monotonic)
+    create_turn_context = ProviderTurnContext.create.__func__
+
+    def create_with_virtual_clock(cls, **kwargs):
+        kwargs["monotonic"] = clock.monotonic
+        return create_turn_context(cls, **kwargs)
+
+    monkeypatch.setattr(
+        ProviderTurnContext, "create", classmethod(create_with_virtual_clock)
+    )
+    harness.provider._last_dialectic_turn = -999
+    history = [
+        {"role": role, "content": f"synthetic prior {index}"}
+        for index in range(4)
+        for role in ("user", "assistant")
+    ]
+    try:
+        result = harness.turn(conversation_history=history)
+        final_model_context = harness.final_user_content()
+
+        assert result["completed"] is True
+        assert harness.provider._turn_count == 5
+        assert init_worker.is_alive() is False
+        authority = harness.provider._turn_context
+        assert isinstance(authority, ProviderTurnContext)
+        assert authority.turn == 5
+        assert GENERIC_BASE in final_model_context
+        assert DIRECT in final_model_context
+        assert "Pinewood Athletic Complex" in final_model_context
+        assert "insufficient shaded spectator seating" in final_model_context
+        assert harness.manager.get_all_tool_schemas() == []
+        assert workers["honcho-prefetch-first"].is_alive() is False
+        assert harness.provider._last_dialectic_turn == 5
+        assert harness.provider._prefetch_result == ""
+        scoped_chats = [
+            call
+            for call in transport.calls
+            if str(call["path"]).endswith("/chat")
+            and call["context"] is authority
+        ]
+        assert len(scoped_chats) == 1
+        assert QUERY in json.dumps(scoped_chats[0]["body"])
+        assert not any(
+            call["method"] == "POST" and str(call["path"]).endswith("/messages")
+            for call in harness.transport.calls
         )
     finally:
         harness.close()

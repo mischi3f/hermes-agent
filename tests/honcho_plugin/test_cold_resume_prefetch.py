@@ -284,6 +284,47 @@ def test_cold_resumed_dialectic_uses_existing_combined_startup_window(monkeypatc
     assert "insufficient shaded spectator seating" in result
 
 
+def test_cold_resumed_dialectic_uses_unused_base_window_before_consumption(
+    monkeypatch,
+):
+    """Fast base work must not shorten the existing combined query window."""
+    import plugins.memory.honcho as honcho_module
+
+    clock = _VirtualClock()
+    provider, manager = _cold_resumed_provider(
+        deadline_seconds=10.0, monotonic=clock.monotonic
+    )
+    provider._last_dialectic_turn = -999
+    provider._FIRST_TURN_BASE_TIMEOUT = 3.0
+    provider._FIRST_TURN_DIALECTIC_CAP = 2.0
+    provider._config.context_tokens = 3000
+    provider._config.dialectic_reasoning_level = "low"
+    manager.dialectic_query.return_value = (
+        "Pinewood Athletic Complex; insufficient shaded spectator seating."
+    )
+    workers = {}
+
+    def start_worker(target, *, name):
+        delay = 4.0 if name == "honcho-prefetch-first" else 0.2
+        worker = _DelayedVirtualWorker(target, clock=clock, delay=delay)
+        workers[name] = worker
+        return worker
+
+    monkeypatch.setattr(provider, "_start_owned_worker", start_worker)
+    monkeypatch.setattr(honcho_module.time, "monotonic", clock.monotonic)
+
+    result = provider.prefetch("Which facility and concern did we discuss?")
+
+    assert clock.monotonic() <= 105.0
+    assert workers["honcho-base-first"].join_timeout <= 3.0
+    assert workers["honcho-prefetch-first"].join_timeout <= 5.0
+    assert "Pinewood Athletic Complex" in result
+    assert "insufficient shaded spectator seating" in result
+    assert manager.dialectic_query.call_count == 1
+    assert provider._last_dialectic_turn == 3
+    assert provider._prefetch_result == ""
+
+
 def test_cold_resumed_dialectic_fails_closed_when_capacity_cannot_be_reserved(
     monkeypatch,
 ):
