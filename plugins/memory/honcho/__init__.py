@@ -21,6 +21,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -46,6 +47,31 @@ from plugins.memory.honcho.turn_context import (
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+_DIALECTIC_TRACE_CHECKPOINTS = frozenset(
+    {"schedule", "worker", "provider", "validation", "publish", "consume", "assembly"}
+)
+_DIALECTIC_TRACE_FIELDS = frozenset(
+    {
+        "should_run",
+        "cadence_eligible",
+        "worker_started",
+        "query_completed",
+        "query_result_nonempty",
+        "provider_result_observed",
+        "validation_pass",
+        "result_published",
+        "publish_generation",
+        "current_generation",
+        "authority_generation",
+        "result_consumed",
+        "consume_generation",
+        "stale_rejected",
+        "render_nonempty",
+        "dialectic_layer_attached",
+        "turn",
+    }
+)
 
 
 @dataclass
@@ -379,10 +405,35 @@ class HonchoMemoryProvider(MemoryProvider):
         self._turn_context: Optional[ProviderTurnContext] = None
         self._turn_generation = 0
         self._active_turn_number: Optional[int] = None
+        self._dialectic_trace_token = uuid.uuid4().hex[:8]
 
     @property
     def name(self) -> str:
         return "honcho"
+
+    def _dialectic_trace_enabled(self) -> bool:
+        raw = getattr(self._config, "raw", None)
+        return isinstance(raw, dict) and raw.get("diagnosticTrace") is True
+
+    def _trace_dialectic(self, checkpoint: str, **fields: bool | int) -> None:
+        """Emit one opt-in, content-free dialectic lifecycle checkpoint."""
+        if (
+            not self._dialectic_trace_enabled()
+            or checkpoint not in _DIALECTIC_TRACE_CHECKPOINTS
+            or any(name not in _DIALECTIC_TRACE_FIELDS for name in fields)
+            or any(type(value) not in {bool, int} for value in fields.values())
+        ):
+            return
+        rendered = " ".join(
+            f"{name}={str(value).lower() if isinstance(value, bool) else value}"
+            for name, value in sorted(fields.items())
+        )
+        logger.info(
+            "honcho_dialectic_trace trace=%s checkpoint=%s %s",
+            self._dialectic_trace_token,
+            checkpoint,
+            rendered,
+        )
 
     def _start_owned_worker(
         self,
@@ -1127,7 +1178,15 @@ class HonchoMemoryProvider(MemoryProvider):
         # surfaced by the next turn because the provider instance will exit.
         _dia_wait = 0.0
         _dia_deadline = None
-        if self._last_dialectic_turn == -999 and query:
+        should_run_dialectic = self._last_dialectic_turn == -999 and bool(query)
+        self._trace_dialectic(
+            "schedule",
+            should_run=should_run_dialectic,
+            cadence_eligible=should_run_dialectic,
+            turn=self._turn_count,
+            current_generation=self._dialectic_generation,
+        )
+        if should_run_dialectic:
             _dia_wait = self._FIRST_TURN_DIALECTIC_CAP
             request_timeout = getattr(self._config, "timeout", None)
             if request_timeout is not None:
@@ -1212,11 +1271,24 @@ class HonchoMemoryProvider(MemoryProvider):
                             dialectic_turn_context.ledger.release(
                                 _dialectic_reservation
                             )
+                    self._trace_dialectic(
+                        "worker",
+                        query_completed=True,
+                        query_result_nonempty=bool(r and r.strip()),
+                        current_generation=_generation,
+                        turn=_fired_at,
+                    )
                     self._publish_query_result(r, _generation, _fired_at)
 
                 self._prefetch_thread_started_at = time.monotonic()
                 self._prefetch_thread = self._start_owned_worker(
                     _run_first_turn, name="honcho-prefetch-first"
+                )
+                self._trace_dialectic(
+                    "worker",
+                    worker_started=self._prefetch_thread is not None,
+                    current_generation=_generation,
+                    turn=_fired_at,
                 )
                 if (
                     self._prefetch_thread is None
@@ -1392,6 +1464,13 @@ class HonchoMemoryProvider(MemoryProvider):
         if dialectic_result and dialectic_result.strip():
             parts.append(dialectic_result)
 
+        self._trace_dialectic(
+            "assembly",
+            dialectic_layer_attached=bool(dialectic_result and dialectic_result.strip()),
+            current_generation=self._dialectic_generation,
+            turn=self._turn_count,
+        )
+
         if not parts:
             return ""
 
@@ -1438,15 +1517,45 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Drop results that no longer track the current conversational pivot.
         stale_limit = self._dialectic_cadence * self._STALE_RESULT_MULTIPLIER
-        if dialectic_result and fired_at >= 0 and (self._turn_count - fired_at) > stale_limit:
+        stale_rejected = bool(
+            dialectic_result
+            and fired_at >= 0
+            and (self._turn_count - fired_at) > stale_limit
+        )
+        if stale_rejected:
             logger.debug(
                 "Honcho pending dialectic discarded as stale: fired_at=%d, "
                 "turn=%d, limit=%d", fired_at, self._turn_count, stale_limit,
             )
+            self._trace_dialectic(
+                "consume",
+                result_consumed=False,
+                consume_generation=self._dialectic_generation,
+                stale_rejected=True,
+                render_nonempty=False,
+                turn=self._turn_count,
+            )
             return ""
         if not (dialectic_result and dialectic_result.strip()):
+            self._trace_dialectic(
+                "consume",
+                result_consumed=False,
+                consume_generation=self._dialectic_generation,
+                stale_rejected=False,
+                render_nonempty=False,
+                turn=self._turn_count,
+            )
             return ""
-        return self._model_renderer().semantic_text(dialectic_result)
+        rendered = self._model_renderer().semantic_text(dialectic_result)
+        self._trace_dialectic(
+            "consume",
+            result_consumed=True,
+            consume_generation=self._dialectic_generation,
+            stale_rejected=False,
+            render_nonempty=bool(rendered and rendered.strip()),
+            turn=self._turn_count,
+        )
+        return rendered
 
     def _truncate_to_budget(self, text: str) -> str:
         """Truncate text to fit within context_tokens budget if set."""
@@ -1619,16 +1728,27 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def _publish_query_result(self, result: str, generation: int, fired_at: int) -> None:
         """Publish only a result belonging to the current query generation."""
+        published = False
         with self._prefetch_lock:
             if generation != self._dialectic_generation:
-                return
-            if result and result.strip():
+                current_generation = self._dialectic_generation
+            elif result and result.strip():
                 self._prefetch_result = result
                 self._prefetch_result_fired_at = fired_at
                 self._last_dialectic_turn = fired_at
                 self._dialectic_empty_streak = 0
+                current_generation = self._dialectic_generation
+                published = True
             else:
                 self._dialectic_empty_streak += 1
+                current_generation = self._dialectic_generation
+        self._trace_dialectic(
+            "publish",
+            result_published=published,
+            publish_generation=generation,
+            current_generation=current_generation,
+            turn=fired_at,
+        )
 
     def liveness_snapshot(self) -> dict:
         """In-process snapshot of dialectic liveness state for diagnostics.
@@ -1812,6 +1932,11 @@ class HonchoMemoryProvider(MemoryProvider):
             result = self._manager.dialectic_query(
                 self._session_key, prompt, reasoning_level=level,
                 peer="user", relevance_query=query, context=context,
+                trace=(
+                    self._trace_dialectic
+                    if isinstance(context, ProviderTurnContext)
+                    else None
+                ),
             )
             results.append(result or "")
 

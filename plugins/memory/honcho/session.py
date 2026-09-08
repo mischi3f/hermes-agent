@@ -1853,6 +1853,7 @@ class HonchoSessionManager:
         raise_errors: bool = False,
         relevance_query: str | None = None,
         context: Any = None,
+        trace: Callable[..., None] | None = None,
     ) -> str:
         """
         Query Honcho's dialectic endpoint about a peer.
@@ -1942,14 +1943,29 @@ class HonchoSessionManager:
                 session_id=session.honcho_session_id,
                 target_peer_id=target_peer_id,
             )
-            if not self._record_is_valid(
+            if trace is not None:
+                trace(
+                    "provider",
+                    provider_result_observed=bool(result),
+                    authority_generation=getattr(context, "generation", 0),
+                    turn=getattr(context, "turn", 0),
+                )
+            validation_pass = self._record_is_valid(
                 result,
                 context=context,
                 session=session,
                 allowed_peers={session.user_peer_id, session.assistant_peer_id},
                 source_types={"dialectic"},
                 endpoint_binding=binding,
-            ):
+            )
+            if trace is not None:
+                trace(
+                    "validation",
+                    validation_pass=validation_pass,
+                    authority_generation=getattr(context, "generation", 0),
+                    turn=getattr(context, "turn", 0),
+                )
+            if not validation_pass:
                 return ""
             # Only automatic injection uses the Hermes-side character cap.
             if (

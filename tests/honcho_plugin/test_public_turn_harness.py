@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -577,6 +578,80 @@ def test_principal_public_turn_captures_final_api_bound_request(tmp_path, monkey
         assert QUERY in final_user["content"]
         assert DIRECT in final_user["content"]
         assert GENERATED in final_user["content"]
+    finally:
+        harness.close()
+
+
+def test_public_dialectic_trace_proves_each_content_free_checkpoint(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setenv("HONCHO_SAVE_MESSAGES", "false")
+    caplog.set_level(logging.INFO)
+    harness = _start_harness(
+        tmp_path,
+        monkeypatch,
+        config_overrides={"diagnosticTrace": True},
+    )
+    try:
+        harness.turn()
+        trace = "\n".join(
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("honcho_dialectic_trace ")
+        )
+
+        assert "checkpoint=schedule" in trace
+        assert "should_run=true" in trace
+        assert "cadence_eligible=true" in trace
+        assert "checkpoint=worker" in trace
+        assert "worker_started=true" in trace
+        assert "checkpoint=provider" in trace
+        assert "provider_result_observed=true" in trace
+        assert "checkpoint=validation" in trace
+        assert "validation_pass=true" in trace
+        assert "checkpoint=publish" in trace
+        assert "result_published=true" in trace
+        assert "checkpoint=consume" in trace
+        assert "result_consumed=true" in trace
+        assert "stale_rejected=false" in trace
+        assert "render_nonempty=true" in trace
+        assert "checkpoint=assembly" in trace
+        assert "dialectic_layer_attached=true" in trace
+        assert harness.manager.get_all_tool_schemas() == []
+        for forbidden in (
+            QUERY,
+            DIRECT,
+            GENERATED,
+            WORKSPACE,
+            SESSION,
+            USER,
+            ASSISTANT,
+            "synthetic-honcho-key",
+        ):
+            assert forbidden not in trace
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("diagnostic_value", (None, "true", 1))
+def test_public_dialectic_trace_is_off_without_explicit_boolean(
+    tmp_path, monkeypatch, caplog, diagnostic_value
+):
+    caplog.set_level(logging.INFO)
+    overrides = (
+        {} if diagnostic_value is None else {"diagnosticTrace": diagnostic_value}
+    )
+    harness = _start_harness(
+        tmp_path,
+        monkeypatch,
+        config_overrides=overrides,
+    )
+    try:
+        harness.turn()
+        assert not any(
+            record.getMessage().startswith("honcho_dialectic_trace ")
+            for record in caplog.records
+        )
     finally:
         harness.close()
 
