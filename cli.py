@@ -21509,6 +21509,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    memory_query: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21518,6 +21519,8 @@ def main(
             (submitted literally as the first turn); with --oneshot/-Q or a
             non-TTY it answers and exits. Alias: -q
         q: Shorthand for --query
+        memory_query: Optional clean first-turn query used only for external
+            memory retrieval; model input remains ``query``.
         oneshot: With -q: force the legacy answer-and-exit single-query mode
             even on a TTY.
         image: Optional local image path to attach to a single query
@@ -21653,6 +21656,12 @@ def main(
     
     # Handle query shorthand
     query = query or q
+    if memory_query is not None:
+        if not isinstance(memory_query, str) or not memory_query.strip():
+            raise ValueError("memory_query must be a non-empty string")
+        if not query:
+            raise ValueError("memory_query requires a query")
+        memory_query = memory_query.strip()
     
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
@@ -22015,6 +22024,7 @@ def main(
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
+                                memory_query=memory_query,
                             )
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")

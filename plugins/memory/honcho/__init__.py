@@ -59,7 +59,7 @@ _DIALECTIC_TRACE_FIELDS = frozenset(
         "query_completed",
         "query_result_nonempty",
         "provider_result_observed",
-        "validation_pass",
+        "record_valid",
         "result_published",
         "publish_generation",
         "current_generation",

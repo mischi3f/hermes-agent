@@ -34,6 +34,14 @@ def test_chat_parser_accepts_query_file():
     assert args.query is None
 
 
+def test_chat_parser_accepts_separate_memory_query():
+    args = _parse(
+        ["chat", "-q", "model-facing scaffold", "--memory-query", "clean question"]
+    )
+    assert args.query == "model-facing scaffold"
+    assert args.memory_query == "clean question"
+
+
 def test_query_file_reads_hostile_text_verbatim(tmp_path, monkeypatch):
     """The file body must reach args.query byte-identical — no shell pass."""
     f = tmp_path / "dm.txt"

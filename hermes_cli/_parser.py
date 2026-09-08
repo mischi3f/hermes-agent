@@ -369,6 +369,11 @@ def build_top_level_parser():
         ),
     )
     chat_parser.add_argument(
+        "--memory-query",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    chat_parser.add_argument(
         "--oneshot",
         dest="oneshot_exit",
         action="store_true",

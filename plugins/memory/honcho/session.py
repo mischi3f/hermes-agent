@@ -1961,7 +1961,7 @@ class HonchoSessionManager:
             if trace is not None:
                 trace(
                     "validation",
-                    validation_pass=validation_pass,
+                    record_valid=validation_pass,
                     authority_generation=getattr(context, "generation", 0),
                     turn=getattr(context, "turn", 0),
                 )

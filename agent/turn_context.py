@@ -517,6 +517,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    memory_query: Optional[str] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -1437,7 +1438,13 @@ def build_turn_context(
     # Notify memory providers of the new turn (BEFORE prefetch_all).
     if agent._memory_manager:
         try:
-            _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
+            _turn_msg = (
+                memory_query.strip()
+                if isinstance(memory_query, str) and memory_query.strip()
+                else original_user_message
+                if isinstance(original_user_message, str)
+                else ""
+            )
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
         except Exception:
             pass
@@ -1449,7 +1456,13 @@ def build_turn_context(
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
+            _query = (
+                memory_query.strip()
+                if isinstance(memory_query, str) and memory_query.strip()
+                else original_user_message
+                if isinstance(original_user_message, str)
+                else ""
+            )
             if not is_trivial_prompt(_query):
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
