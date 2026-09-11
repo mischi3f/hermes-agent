@@ -185,7 +185,44 @@ _EXTRA_KEYS = frozenset({
     # with the entry so a restart doesn't downgrade a billing bench back to a
     # 60s transient cooldown.
     "failure_reason",
+    # Sanitized, non-secret Codex allocation identity.
+    "chatgpt_account_id", "chatgpt_plan_type",
 })
+
+
+def codex_identity_metadata_from_token(access_token: str) -> Dict[str, str]:
+    """Extract the only non-secret Codex JWT claims approved for persistence."""
+    claims = _decode_jwt_claims(str(access_token or ""))
+    namespace = claims.get("https://api.openai.com/auth") if isinstance(claims, dict) else None
+    account_id = namespace.get("chatgpt_account_id") if isinstance(namespace, dict) else None
+    if (
+        not isinstance(account_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", account_id)
+    ):
+        raise ValueError(
+            "OpenAI Codex OAuth token is missing a valid chatgpt account ID"
+        )
+    result = {"chatgpt_account_id": account_id}
+    plan = namespace.get("chatgpt_plan_type")
+    if isinstance(plan, str) and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", plan
+    ):
+        result["chatgpt_plan_type"] = plan
+    return result
+
+
+def _validated_codex_identity_extra(
+    entry: "PooledCredential", access_token: str
+) -> Dict[str, Any]:
+    """Bind refreshed/synchronized Codex token material to the same account."""
+    identity = codex_identity_metadata_from_token(access_token)
+    bound_account_id = str(entry.extra.get("chatgpt_account_id") or "").strip()
+    observed_account_id = identity["chatgpt_account_id"]
+    if bound_account_id and observed_account_id != bound_account_id:
+        raise ValueError(
+            "Refusing Codex token rotation because the authenticated account changed"
+        )
+    return {**entry.extra, **identity}
 
 
 def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
@@ -1063,7 +1100,7 @@ class CredentialPool:
         device_code-sourced entries; env/API-key-sourced entries have no
         auth.json shadow to sync from.
         """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
             with _auth_store_lock():
@@ -1109,6 +1146,24 @@ class CredentialPool:
                 should_adopt = True
 
             if should_adopt:
+                if not store_access:
+                    logger.warning(
+                        "Pool entry %s: refusing refresh-token-only Codex sync "
+                        "because account identity cannot be verified",
+                        entry.id,
+                    )
+                    return entry
+                try:
+                    identity_extra = _validated_codex_identity_extra(
+                        entry, store_access
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Pool entry %s: refusing Codex singleton sync because "
+                        "the account identity changed",
+                        entry.id,
+                    )
+                    return entry
                 logger.debug(
                     "Pool entry %s: syncing Codex tokens from auth.json "
                     "(refreshed by another process)",
@@ -1123,6 +1178,7 @@ class CredentialPool:
                     "last_error_reason": None,
                     "last_error_message": None,
                     "last_error_reset_at": None,
+                    "extra": identity_extra,
                 }
                 if state.get("last_refresh"):
                     field_updates["last_refresh"] = state["last_refresh"]
@@ -1720,11 +1776,15 @@ class CredentialPool:
                     entry.access_token,
                     entry.refresh_token,
                 )
+                identity_extra = _validated_codex_identity_extra(
+                    entry, refreshed["access_token"]
+                )
                 updated = replace(
                     entry,
                     access_token=refreshed["access_token"],
                     refresh_token=refreshed["refresh_token"],
                     last_refresh=refreshed.get("last_refresh"),
+                    extra=identity_extra,
                 )
             elif self.provider == "xai-oauth":
                 # Adopt fresher tokens from auth.json before spending the
@@ -3514,6 +3574,45 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    identity_changed = False
+    if provider == "openai-codex":
+        hydrated_entries = []
+        for entry in entries:
+            try:
+                identity = codex_identity_metadata_from_token(entry.access_token)
+            except ValueError:
+                hydrated_entries.append(entry)
+                continue
+            bound_account_id = str(
+                entry.extra.get("chatgpt_account_id") or ""
+            ).strip()
+            if (
+                bound_account_id
+                and identity["chatgpt_account_id"] != bound_account_id
+            ):
+                if not (
+                    entry.last_status == STATUS_DEAD
+                    and entry.last_error_reason
+                    == "codex_account_identity_mismatch"
+                ):
+                    entry = replace(
+                        entry,
+                        last_status=STATUS_DEAD,
+                        last_status_at=time.time(),
+                        last_error_reason="codex_account_identity_mismatch",
+                        last_error_message=(
+                            "Persisted Codex account identity does not match token"
+                        ),
+                        last_error_reset_at=None,
+                    )
+                    identity_changed = True
+            elif any(
+                entry.extra.get(key) != value for key, value in identity.items()
+            ):
+                entry = replace(entry, extra={**entry.extra, **identity})
+                identity_changed = True
+            hydrated_entries.append(entry)
+        entries = hydrated_entries
     raw_needs_auth_normalization = any(
         isinstance(payload, dict)
         and _normalize_pool_auth_type(
@@ -3534,7 +3633,12 @@ def load_pool(provider: str) -> CredentialPool:
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
         custom_changed, custom_sources = _seed_custom_pool(provider, entries)
-        changed = raw_needs_sanitization or raw_needs_auth_normalization or custom_changed
+        changed = (
+            raw_needs_sanitization
+            or raw_needs_auth_normalization
+            or identity_changed
+            or custom_changed
+        )
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
         singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
@@ -3542,6 +3646,7 @@ def load_pool(provider: str) -> CredentialPool:
         changed = (
             raw_needs_sanitization
             or raw_needs_auth_normalization
+            or identity_changed
             or singleton_changed
             or env_changed
         )

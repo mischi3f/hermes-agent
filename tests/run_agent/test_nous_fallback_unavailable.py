@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+from agent.error_classifier import FailoverReason
 from run_agent import AIAgent
 
 
@@ -57,7 +58,7 @@ class TestNousFallbackLocalAvailability:
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(_mock_client(api_key="fb"), "gpt-5.5"),
         ):
-            activated = agent._try_activate_fallback(None)
+            activated = agent._try_activate_fallback(FailoverReason.timeout)
         assert activated is True
         assert agent.model == "gpt-5.5"
 
@@ -73,7 +74,7 @@ class TestNousFallbackLocalAvailability:
             "hermes_cli.auth.get_provider_auth_state",
             return_value={},
         ):
-            agent._try_activate_fallback(None)
+            agent._try_activate_fallback(FailoverReason.timeout)
         key = (
             "nous",
             "anthropic/claude-sonnet-4.6",
@@ -96,6 +97,6 @@ class TestNousFallbackLocalAvailability:
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(_mock_client(api_key="fb"), "anthropic/claude-sonnet-4.6"),
         ):
-            activated = agent._try_activate_fallback(None)
+            activated = agent._try_activate_fallback(FailoverReason.timeout)
         assert activated is True
         assert agent.provider == "nous"

@@ -1,4 +1,4 @@
-"""Auth-failure provider failover (conversation loop).
+"""Auth failures fail closed at the provider boundary.
 
 A 401/403 that survives the per-provider credential-refresh attempt
 (revoked OAuth, blocked/expired key, an account pinned to a dead/staging
@@ -84,19 +84,20 @@ class TestAuthFailoverActivation:
             and agent._fallback_index < len(agent._fallback_chain)
         )
 
-    def test_auth_failover_fires_when_chain_present(self):
+    def test_auth_failover_is_denied_when_chain_present(self):
         agent = _make_agent(fallback_model=[{"provider": "openai", "model": "gpt-4o"}])
         retry = TurnRetryState()
         classified = classify_api_error(_auth_error(401))
+        # The legacy loop predicate may still be reached, but the centralized
+        # activation gate must deny auth before mutating fallback state.
         assert self._should_failover(agent, classified, retry) is True
-        # And the activation primitive actually advances on an auth reason.
         with patch(
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(_mock_client(), "gpt-4o"),
         ):
             advanced = agent._try_activate_fallback(reason=classified.reason)
-        assert advanced is True
-        assert agent._fallback_index == 1
+        assert advanced is False
+        assert agent._fallback_index == 0
 
     def test_no_failover_without_chain(self):
         """A user with no fallback configured (the common case for the

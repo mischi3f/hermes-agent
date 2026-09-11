@@ -10441,14 +10441,19 @@ def _call_llm_impl(
         # auxiliary task on the floor (silent compression failure /
         # message loss). Auth is NOT a capacity error: it only bypasses
         # the explicit-provider gate when the user is in auto mode.
-        should_fallback = (
-            _is_auth_error(first_err)
-            or _is_payment_error(first_err)
-            or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
-            or _is_model_incompatible_error(first_err)
-            or _is_invalid_aux_response_error(first_err)
+        from agent.error_classifier import (
+            FailoverReason,
+            classify_api_error,
+            cross_provider_fallback_allowed,
         )
+
+        classified_fallback_reason = classify_api_error(first_err).reason
+        if (
+            classified_fallback_reason == FailoverReason.unknown
+            and _is_connection_error(first_err)
+        ):
+            classified_fallback_reason = FailoverReason.timeout
+        should_fallback = cross_provider_fallback_allowed(classified_fallback_reason)
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
         # serve the request due to capacity: payment/quota exhaustion and
@@ -10465,14 +10470,7 @@ def _call_llm_impl(
         # fallback asked to compress a glm-5.2 conversation), so they bypass
         # the explicit-provider gate and continue to the next candidate
         # instead of aborting the auxiliary task and churning the session.
-        is_capacity_error = (
-            _is_payment_error(first_err)
-            or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
-            or _is_model_incompatible_error(first_err)
-            or _is_invalid_aux_response_error(first_err)
-        )
-        if should_fallback and (is_auto or is_capacity_error):
+        if should_fallback:
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -11151,14 +11149,19 @@ async def _async_call_llm_impl(
         # falls back in auto mode just like the sync call_llm() path. Auth is
         # NOT a capacity error, so on an explicit provider it still respects
         # the user's choice (handled by the is_auto/is_capacity_error gate).
-        should_fallback = (
-            _is_auth_error(first_err)
-            or _is_payment_error(first_err)
-            or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
-            or _is_model_incompatible_error(first_err)
-            or _is_invalid_aux_response_error(first_err)
+        from agent.error_classifier import (
+            FailoverReason,
+            classify_api_error,
+            cross_provider_fallback_allowed,
         )
+
+        classified_fallback_reason = classify_api_error(first_err).reason
+        if (
+            classified_fallback_reason == FailoverReason.unknown
+            and _is_connection_error(first_err)
+        ):
+            classified_fallback_reason = FailoverReason.timeout
+        should_fallback = cross_provider_fallback_allowed(classified_fallback_reason)
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
         # regardless of user intent. Rate limits are included: after retries
@@ -11167,14 +11170,7 @@ async def _async_call_llm_impl(
         # Model-incompatibility 400s (route cannot run this model at all)
         # bypass the gate too — see the sync call_llm() path for rationale.
         is_auto = resolved_provider in {"auto", "", None}
-        is_capacity_error = (
-            _is_payment_error(first_err)
-            or _is_connection_error(first_err)
-            or _is_rate_limit_error(first_err)
-            or _is_model_incompatible_error(first_err)
-            or _is_invalid_aux_response_error(first_err)
-        )
-        if should_fallback and (is_auto or is_capacity_error):
+        if should_fallback:
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):

@@ -15,6 +15,7 @@ Three behaviors salvaged from PR #79787:
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
+from agent.error_classifier import FailoverReason
 
 
 def _make_agent(fallback_model=None):
@@ -71,7 +72,7 @@ def _activate(agent, resolved_base_url, resolved_model, build_anthropic=None):
         ),
     ]
     with patches[0], patches[1] as mock_rpc, patches[2], patches[3]:
-        assert agent._try_activate_fallback() is True
+        assert agent._try_activate_fallback(FailoverReason.timeout) is True
     return mock_rpc
 
 

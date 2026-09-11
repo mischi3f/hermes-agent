@@ -898,6 +898,4 @@ def _yn(value: bool) -> str:
 
 
 def _redact_token(token: str) -> str:
-    if len(token) < 16:
-        return token
-    return f"{token[:12]}…{token[-4:]}"
+    return "[credential redacted]" if token else ""

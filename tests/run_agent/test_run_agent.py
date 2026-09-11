@@ -660,9 +660,9 @@ class TestMaskApiKey:
     def test_long_key_masked(self, agent):
         key = "sk-or-v1-abcdefghijklmnop"
         result = agent._mask_api_key_for_logs(key)
-        assert result.startswith("sk-or-v1")
-        assert result.endswith("mnop")
-        assert "..." in result
+        assert result == "[credential redacted]"
+        assert key[:8] not in result
+        assert key[-4:] not in result
 
 
 # ===================================================================
@@ -3123,7 +3123,7 @@ class TestRunConversation:
             },
         ]
 
-    def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
+    def test_codex_content_filter_incomplete_fails_closed(self, agent):
         self._setup_agent(agent)
         agent.api_mode = "codex_responses"
         agent.provider = "openai-codex"
@@ -3144,30 +3144,16 @@ class TestRunConversation:
             model="gpt-5.5",
             usage=None,
         )
-        fallback_response = SimpleNamespace(
-            status="completed",
-            incomplete_details=None,
-            output=[
-                SimpleNamespace(
-                    type="message",
-                    status="completed",
-                    content=[SimpleNamespace(type="output_text", text="Recovered on fallback")],
-                )
-            ],
-            model="fallback/model",
-            usage=None,
-        )
         hook_events = []
         logical_completions = []
 
         def _fake_activate(reason=None):
-            agent._fallback_index = len(agent._fallback_chain)
-            return True
+            return False
 
         with (
             patch.object(agent, "_create_request_openai_client", return_value=MagicMock()),
             patch.object(agent, "_close_request_openai_client"),
-            patch.object(agent, "_run_codex_stream", side_effect=[content_filter_response, fallback_response]) as mock_run_codex_stream,
+            patch.object(agent, "_run_codex_stream", return_value=content_filter_response) as mock_run_codex_stream,
             patch.object(agent, "_try_activate_fallback", side_effect=_fake_activate) as mock_try_activate_fallback,
             patch.object(agent, "_invoke_api_request_error_hook", side_effect=lambda **kw: hook_events.append(kw)),
             patch(
@@ -3182,16 +3168,14 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("summarize this large Slack thread")
 
-        assert result["final_response"] == "Recovered on fallback"
-        assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
-        assert mock_run_codex_stream.call_count == 2
+        assert result["failed"] is True
+        assert "declined" in result["final_response"].lower()
+        mock_try_activate_fallback.assert_called_once_with(FailoverReason.content_policy_blocked)
+        assert mock_run_codex_stream.call_count == 1
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
         assert hook_events[0]["reason"] == FailoverReason.content_policy_blocked.value
-        assert logical_completions == [
-            (hook_events[0]["api_request_id"], "success")
-        ]
+        assert logical_completions == []
 
     def test_ollama_small_runtime_context_fails_before_api_call(self, agent, caplog):
         self._setup_agent(agent)
@@ -3669,8 +3653,8 @@ class TestRunConversation:
         assert request_kwargs[1]["extra_headers"]["X-Custom-Header"] == "preserved"
         assert request_kwargs[1]["extra_headers"]["X-OpenRouter-Cache"] == "false"
 
-    def test_empty_response_triggers_fallback_provider(self, agent):
-        """After 3 empty retries, fallback provider is activated and produces content."""
+    def test_empty_response_does_not_cross_provider_without_typed_transient_error(self, agent):
+        """Unknown empty responses fail closed after bounded same-provider retries."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
         # Configure a fallback chain
@@ -3679,23 +3663,17 @@ class TestRunConversation:
         agent._fallback_activated = False
 
         empty_resp = _mock_response(content=None, finish_reason="stop")
-        content_resp = _mock_response(content="Fallback answer.", finish_reason="stop")
-        # 4 empty (1 orig + 3 retries), then fallback model answers
+        # 4 empty (1 original + 3 retries); unknown is not allowlisted.
         agent.client.chat.completions.create.side_effect = [
-            empty_resp, empty_resp, empty_resp, empty_resp, content_resp,
+            empty_resp, empty_resp, empty_resp, empty_resp,
         ]
 
         fallback_called = {"called": False}
 
-        def _mock_fallback():
+        def _mock_fallback(reason):
             fallback_called["called"] = True
-            # Simulate what _try_activate_fallback does: just advance the
-            # index and set the flag (the client is already mocked).
-            agent._fallback_index = 1
-            agent._fallback_activated = True
-            agent.model = "anthropic/claude-sonnet-4"
-            agent.provider = "openrouter"
-            return True
+            assert reason == FailoverReason.unknown
+            return False
 
         with (
             patch.object(agent, "_persist_session"),
@@ -3704,9 +3682,9 @@ class TestRunConversation:
             patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
         ):
             result = agent.run_conversation("answer me")
-        assert fallback_called["called"], "Fallback should have been triggered"
+        assert fallback_called["called"], "Policy gate should have been consulted"
         assert result["completed"] is True
-        assert result["final_response"] == "Fallback answer."
+        assert "No reply:" in result["final_response"]
 
     def test_empty_response_fallback_also_empty_returns_empty(self, agent):
         """If fallback also returns empty, final response is (empty)."""
@@ -3724,14 +3702,9 @@ class TestRunConversation:
             empty_resp, empty_resp, empty_resp, empty_resp,  # fallback exhausted
         ]
 
-        def _mock_fallback():
-            if agent._fallback_index >= len(agent._fallback_chain):
-                return False
-            agent._fallback_index += 1
-            agent._fallback_activated = True
-            agent.model = "anthropic/claude-sonnet-4"
-            agent.provider = "openrouter"
-            return True
+        def _mock_fallback(reason):
+            assert reason == FailoverReason.unknown
+            return False
 
         with (
             patch.object(agent, "_persist_session"),
@@ -5839,7 +5812,7 @@ class TestFallbackAnthropicProvider:
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None),
         ):
             mock_build.return_value = MagicMock()
-            result = agent._try_activate_fallback()
+            result = agent._try_activate_fallback(FailoverReason.timeout)
 
         assert result is True
         assert agent.api_mode == "anthropic_messages"
@@ -5861,7 +5834,7 @@ class TestFallbackAnthropicProvider:
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None),
         ):
-            agent._try_activate_fallback()
+            agent._try_activate_fallback(FailoverReason.timeout)
 
         assert agent._use_prompt_caching is True
 
@@ -7013,7 +6986,7 @@ class TestFallbackSetsOAuthFlag:
             patch("agent.anthropic_adapter.resolve_anthropic_token",
                   return_value=None),
         ):
-            result = agent._try_activate_fallback()
+            result = agent._try_activate_fallback(FailoverReason.timeout)
 
         assert result is True
         assert agent._is_anthropic_oauth is True
@@ -7036,7 +7009,7 @@ class TestFallbackSetsOAuthFlag:
             patch("agent.anthropic_adapter.resolve_anthropic_token",
                   return_value=None),
         ):
-            result = agent._try_activate_fallback()
+            result = agent._try_activate_fallback(FailoverReason.timeout)
 
         assert result is True
         assert agent._is_anthropic_oauth is False

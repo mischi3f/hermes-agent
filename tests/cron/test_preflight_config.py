@@ -161,9 +161,8 @@ class TestMissingProviderKeyBlocks:
         )
         assert "blocked" in deliveries[0].lower()
 
-    def test_fallback_chain_rescues_missing_primary_key(self, tmp_path):
-        """A configured fallback chain means a missing primary key does NOT
-        block — the existing auth-fallback path handles it."""
+    def test_fallback_chain_does_not_rescue_missing_primary_key(self, tmp_path):
+        """Authentication failure is denied at the cross-provider boundary."""
         (tmp_path / "config.yaml").write_text(
             "fallback_providers:\n"
             "  - provider: openrouter\n"
@@ -186,9 +185,10 @@ class TestMissingProviderKeyBlocks:
             success, output, final_response, error, agent_constructed = \
                 _run_job_patched(job, tmp_path, resolve=resolve)
 
-        assert agent_constructed is True
-        assert success is True
-        assert error is None
+        assert agent_constructed is False
+        assert success is False
+        assert error is not None
+        assert calls == [None]
 
 
 class TestHealthyJobUnaffected:

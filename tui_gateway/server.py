@@ -8768,39 +8768,11 @@ def _resolve_runtime_with_fallback(
             None,
             False,
         )
-    except AuthError as primary_exc:
-        fb_chain = _load_fallback_model() or []
-        for entry in fb_chain:
-            if not isinstance(entry, dict):
-                continue
-            fb_provider = str(entry.get("provider") or "").strip()
-            fb_model = str(entry.get("model") or "").strip()
-            if not fb_provider or not fb_model:
-                continue
-            try:
-                from hermes_cli.fallback_config import resolve_entry_api_key
-
-                fb_kwargs: dict = {
-                    "requested": fb_provider,
-                    "target_model": fb_model,
-                }
-                if entry.get("base_url"):
-                    fb_kwargs["explicit_base_url"] = entry["base_url"]
-                fb_api_key = resolve_entry_api_key(entry)
-                if fb_api_key:
-                    fb_kwargs["explicit_api_key"] = fb_api_key
-                runtime = resolve_runtime_provider(**fb_kwargs)
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "Primary auth failed (%s), falling back to %s model %s",
-                    primary_exc,
-                    fb_provider,
-                    fb_model,
-                )
-                return _RuntimeFallbackResolution(runtime, fb_model, True)
-            except Exception:
-                continue
+    except AuthError:
+        # Authentication/authorization is never eligible to cross a provider
+        # boundary. The normal same-provider refresh/rotation path has already
+        # run inside runtime resolution; fail closed here without probing a
+        # configured fallback.
         raise
 
 

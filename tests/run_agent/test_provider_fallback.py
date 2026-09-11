@@ -97,7 +97,7 @@ def test_fallback_reason_text_defaults_when_reason_is_missing():
 class TestFallbackChainAdvancement:
     def test_exhausted_returns_false(self):
         agent = _make_agent(fallback_model=None)
-        assert agent._try_activate_fallback() is False
+        assert agent._try_activate_fallback(FailoverReason.timeout) is False
 
     def test_advances_index(self):
         fbs = [
@@ -107,7 +107,7 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=fbs)
         with patch("agent.auxiliary_client.resolve_provider_client",
                     return_value=(_mock_client(), "gpt-4o")):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(FailoverReason.timeout) is True
             assert agent._fallback_index == 1
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
@@ -169,7 +169,7 @@ class TestFallbackChainAdvancement:
                 (None, None),                    # broken provider
                 (_mock_client(), "gpt-4o"),       # fallback succeeds
             ]
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(FailoverReason.timeout) is True
             assert agent.model == "gpt-4o"
             assert agent._fallback_index == 2
 
@@ -185,7 +185,7 @@ class TestFallbackChainAdvancement:
                 RuntimeError("auth failed"),
                 (_mock_client(), "gpt-4o"),
             ]
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(FailoverReason.timeout) is True
             assert agent.model == "gpt-4o"
 
     def test_resolves_key_env_for_fallback_provider(self):
@@ -211,7 +211,7 @@ class TestFallbackChainAdvancement:
                 ),
             ) as mock_rpc,
         ):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(FailoverReason.timeout) is True
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
 
@@ -259,7 +259,7 @@ class TestFallbackChainAdvancement:
                 side_effect=_fake_build,
             ),
         ):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(FailoverReason.timeout) is True
 
         assert agent.api_mode == "anthropic_messages"
         assert agent.provider == "nous"
@@ -295,7 +295,7 @@ class TestFallbackChainAdvancement:
                 side_effect=AssertionError("must not build Anthropic client"),
             ),
         ):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(FailoverReason.timeout) is True
 
         assert agent.api_mode == "chat_completions"
         assert agent.client is not None
@@ -353,7 +353,7 @@ class TestFallbackChainDedup:
             return _mock_client(), model
         with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_resolve):
             with patch("hermes_cli.model_normalize.normalize_model_for_provider", side_effect=lambda m, p: m):
-                ok = agent._try_activate_fallback()
+                ok = agent._try_activate_fallback(FailoverReason.timeout)
 
         assert ok is True
         # The first entry was skipped — only the second reached resolve.
@@ -373,7 +373,7 @@ class TestFallbackChainDedup:
         agent.base_url = "https://openrouter.ai/api/v1"
 
         with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
-            ok = agent._try_activate_fallback()
+            ok = agent._try_activate_fallback(FailoverReason.timeout)
 
         assert ok is False
         mock_resolve.assert_not_called()
@@ -408,7 +408,7 @@ class TestFallbackChainDedup:
                 "hermes_cli.model_normalize.normalize_model_for_provider",
                 side_effect=lambda m, p: m,
             ):
-                ok = agent._try_activate_fallback()
+                ok = agent._try_activate_fallback(FailoverReason.timeout)
 
         assert ok is True
         assert called == [("xai", "grok-4.5")]
@@ -469,7 +469,7 @@ class TestFallbackExtraBodyReResolution:
             "agent.model_metadata.get_model_context_length",
             return_value=128_000,
         ):
-            assert agent._try_activate_fallback() is True
+            assert agent._try_activate_fallback(FailoverReason.timeout) is True
 
     def test_stale_provider_keys_removed_and_new_provider_merged(self):
         agent = self._agent_with_custom_providers()

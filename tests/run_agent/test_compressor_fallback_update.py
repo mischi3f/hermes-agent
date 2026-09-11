@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
+from agent.error_classifier import FailoverReason
 from agent.context_compressor import ContextCompressor
 
 
@@ -58,7 +59,7 @@ def test_compressor_updated_on_fallback(mock_ctx_len, mock_resolve):
     agent._is_direct_openai_url = lambda url: "api.openai.com" in url
     agent._emit_status = lambda msg: None
 
-    result = agent._try_activate_fallback()
+    result = agent._try_activate_fallback(FailoverReason.timeout)
 
     assert result is True
     assert agent._fallback_activated is True

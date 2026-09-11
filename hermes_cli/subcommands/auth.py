@@ -29,6 +29,10 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     )
     auth_add.add_argument("--label", help="Optional display label")
     auth_add.add_argument(
+        "--expected-account-id",
+        help="Require this OpenAI Codex account ID before saving OAuth credentials",
+    )
+    auth_add.add_argument(
         "--api-key", help="API key value (otherwise prompted securely)"
     )
     auth_add.add_argument("--portal-url", help="Nous portal base URL")
@@ -59,9 +63,14 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "target", help="Credential index, entry id, or exact label"
     )
     auth_reset = auth_subparsers.add_parser(
-        "reset", help="Clear exhaustion status for all credentials for a provider"
+        "reset", help="Clear local cooldown/error status only (does not reauthenticate)"
     )
     auth_reset.add_argument("provider", help="Provider id")
+    auth_probe = auth_subparsers.add_parser(
+        "probe", help="Run a credential-pinned, read-only provider probe"
+    )
+    auth_probe.add_argument("provider", choices=["openai-codex"])
+    auth_probe.add_argument("--credential-id", required=True, help="Exact pooled credential id")
     auth_status = auth_subparsers.add_parser(
         "status", help="Show auth status for a provider"
     )

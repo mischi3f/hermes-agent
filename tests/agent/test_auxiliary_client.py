@@ -1628,13 +1628,8 @@ class TestCallLlmPaymentFallback:
         # Fallback client should have been used
         assert fallback_client.chat.completions.create.called
 
-    def test_401_auth_error_triggers_fallback_in_auto_mode(self, monkeypatch):
-        """401 auth errors should trigger fallback in auto mode (#21165).
-
-        When refresh is unavailable/fails and the user is on the auto chain,
-        a 401 must fall back instead of silently dropping the aux task
-        (which caused compression message loss).
-        """
+    def test_401_auth_error_fails_closed_in_auto_mode(self, monkeypatch):
+        """A persistent 401 must not cross provider boundaries."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
         primary_client = MagicMock()
@@ -1650,15 +1645,14 @@ class TestCallLlmPaymentFallback:
                    return_value=("auto", "minimax/minimax-m2.7", None, None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
                    return_value=(fallback_client, "fallback-model", "openrouter")) as mock_fb:
-            result = call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "hello"}],
-            )
+            with pytest.raises(_AuxAuth401):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
 
-        assert result.choices[0].message.content == "fallback auth response"
-        assert fallback_client.chat.completions.create.called
-        # Labelled as an auth error, not mis-tagged as a connection error.
-        assert mock_fb.call_args.kwargs.get("reason") == "auth error"
+        assert not fallback_client.chat.completions.create.called
+        mock_fb.assert_not_called()
 
 
 
@@ -1845,8 +1839,8 @@ class TestAuxiliaryFallbackLayering:
         mock_main.assert_not_called()
 
 
-    def test_warning_emitted_when_all_fallbacks_exhausted(self, monkeypatch, caplog):
-        """When chain AND main model both fail, a user-visible warning fires before re-raise."""
+    def test_billing_error_fails_closed_without_fallback_warning(self, monkeypatch, caplog):
+        """A deterministic payment/configuration error must not cross providers."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
         primary_client = MagicMock()
@@ -1867,9 +1861,7 @@ class TestAuxiliaryFallbackLayering:
                     messages=[{"role": "user", "content": "hello"}],
                 )
 
-        assert any(
-            "all fallbacks exhausted" in r.message for r in caplog.records
-        ), f"Expected exhaustion warning, got: {[r.message for r in caplog.records]}"
+        assert not any("all fallbacks exhausted" in r.message for r in caplog.records)
 
     def test_explicit_provider_no_client_uses_configured_chain_before_error(self, monkeypatch):
         """Missing primary credentials should still honor auxiliary fallback_chain."""
@@ -3947,10 +3939,8 @@ class TestAuxUnhealthyCache:
         or_try.assert_not_called()
         custom_try.assert_not_called()
 
-    def test_call_llm_marks_provider_unhealthy_on_402(self, monkeypatch):
-        """A 402 from call_llm causes the provider to be marked unhealthy
-        so the next call skips it instead of re-trying the same depleted
-        endpoint."""
+    def test_call_llm_fails_closed_on_402_without_marking_provider(self, monkeypatch):
+        """A 402 requires operator action and must not trigger provider fallback."""
         from agent.auxiliary_client import (
             call_llm,
             _is_provider_unhealthy,
@@ -3979,12 +3969,13 @@ class TestAuxUnhealthyCache:
              patch("agent.auxiliary_client._build_call_kwargs",
                     return_value={"model": "n-model", "messages": [{"role": "user", "content": "hi"}]}):
             assert _is_provider_unhealthy("openrouter") is False
-            call_llm(
-                task="compression",
-                messages=[{"role": "user", "content": "hi"}],
-            )
-            # After the 402, OpenRouter is in the unhealthy cache.
-            assert _is_provider_unhealthy("openrouter") is True
+            with pytest.raises(Exception, match="Payment Required"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+            assert _is_provider_unhealthy("openrouter") is False
+            assert not nous_client.chat.completions.create.called
 
 
 # ── auxiliary_max_tokens_param ──────────────────────────────────────────────

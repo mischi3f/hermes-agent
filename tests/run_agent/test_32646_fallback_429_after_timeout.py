@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent.turn_retry_state import TurnRetryState
+from agent.error_classifier import FailoverReason
 from run_agent import AIAgent
 
 
@@ -106,7 +107,7 @@ class TestFallbackChainResetOnTransportRecovery:
         immediately after ``_try_recover_primary_transport()`` returns
         True.  Once it has run, the chain must be walkable again so
         the post-recovery 429 path can call
-        ``_try_activate_fallback()`` and switch to glm-4.7.
+        ``_try_activate_fallback(FailoverReason.rate_limit)`` and switch to glm-4.7.
         """
         fb_chain = [
             {
@@ -151,7 +152,7 @@ class TestFallbackChainResetOnTransportRecovery:
                 side_effect=lambda m, p: m,
             ),
         ):
-            ok = agent._try_activate_fallback()
+            ok = agent._try_activate_fallback(FailoverReason.rate_limit)
 
         assert ok is True, "fallback chain must be re-attemptable after reset"
         assert agent._fallback_activated is True

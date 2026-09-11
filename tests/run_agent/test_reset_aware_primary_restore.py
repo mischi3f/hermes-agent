@@ -18,6 +18,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
+from agent.error_classifier import FailoverReason
 from agent.credential_pool import (
     STATUS_DEAD,
     STATUS_EXHAUSTED,
@@ -121,7 +122,7 @@ def _activate_fallback(agent):
         "agent.auxiliary_client.resolve_provider_client",
         return_value=(mock_client, None),
     ):
-        assert agent._try_activate_fallback() is True
+        assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
     assert agent._fallback_activated is True
 
 

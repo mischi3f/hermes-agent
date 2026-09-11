@@ -9945,7 +9945,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if is_token_provider(display_key):
             api_key_display = "Microsoft Entra ID"
         elif isinstance(display_key, str) and len(display_key) > 12:
-            api_key_display = f"{display_key[:8]}...{display_key[-4:]}"
+            api_key_display = "Configured (redacted)"
         else:
             api_key_display = "Not set!"
         

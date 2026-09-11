@@ -5108,12 +5108,6 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     blocking here would break that contract (and burning zero LLM calls is
     already guaranteed by the fallback resolution being config-local).
     """
-    try:
-        if get_fallback_chain(cfg):
-            return None
-    except Exception:
-        return None  # fail-open: never block on a preflight-internal error
-
     _cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
     requested = (
         job.get("provider")
@@ -6158,16 +6152,20 @@ def run_job(
             # / Anthropic fallbacks were healthy (Daily Focus Kickoff 2026-08-11).
             # Keeping provider+model atomic still applies — never swap only the
             # provider while retaining a paid primary model.
-            is_auth = isinstance(resolve_exc, AuthError)
             is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
-            if not (is_auth or is_transient_net):
+            from agent.error_classifier import FailoverReason, cross_provider_fallback_allowed
+
+            if not (
+                is_transient_net
+                and cross_provider_fallback_allowed(FailoverReason.timeout)
+            ):
                 raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
             primary_provider_for_drift = (
                 str(getattr(resolve_exc, "provider", "") or "").strip().lower()
                 or primary_provider_for_drift
             )
-            reason = "auth" if is_auth else "transient network"
+            reason = "transient network"
             logger.warning(
                 "Job '%s': primary provider resolve failed (%s: %s), trying fallback",
                 job_id,

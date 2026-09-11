@@ -79,6 +79,44 @@ class FailoverReason(enum.Enum):
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
 
+class CrossProviderFallbackCategory(str, enum.Enum):
+    capacity = "capacity"
+    provider_availability = "provider_availability"
+    transport = "transport"
+    fail_closed = "fail_closed"
+
+
+@dataclass(frozen=True)
+class CrossProviderFallbackDecision:
+    eligible: bool
+    category: CrossProviderFallbackCategory
+    reason: FailoverReason | None
+
+
+def cross_provider_fallback_decision(
+    reason: FailoverReason | None,
+) -> CrossProviderFallbackDecision:
+    """Return an explicit fail-closed cross-provider routing decision."""
+    if reason in {FailoverReason.rate_limit, FailoverReason.upstream_rate_limit}:
+        category = CrossProviderFallbackCategory.capacity
+    elif reason == FailoverReason.overloaded:
+        category = CrossProviderFallbackCategory.provider_availability
+    elif reason == FailoverReason.timeout:
+        category = CrossProviderFallbackCategory.transport
+    else:
+        category = CrossProviderFallbackCategory.fail_closed
+    return CrossProviderFallbackDecision(
+        eligible=category != CrossProviderFallbackCategory.fail_closed,
+        category=category,
+        reason=reason,
+    )
+
+
+def cross_provider_fallback_allowed(reason: FailoverReason | None) -> bool:
+    """Allow only capacity, retryable throttling, outage, and timeout failover."""
+    return cross_provider_fallback_decision(reason).eligible
+
+
 # ── Classification result ───────────────────────────────────────────────
 
 @dataclass

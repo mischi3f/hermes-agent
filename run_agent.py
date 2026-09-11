@@ -2846,9 +2846,7 @@ class AIAgent:
             return "<entra-id-bearer>"
         if not key:
             return None
-        if len(key) <= 12:
-            return "***"
-        return f"{key[:8]}...{key[-4:]}"
+        return "[credential redacted]"
 
     def _clean_error_message(self, error_msg: str) -> str:
         """
@@ -6480,6 +6478,14 @@ class AIAgent:
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
             runtime_base
         )
+
+        # Compression is intentionally kept on the accepted provider/model,
+        # but it must follow same-provider credential rotation. Otherwise a
+        # summary request can keep using the just-exhausted authority.
+        compressor = getattr(self, "context_compressor", None)
+        if compressor is not None:
+            compressor.api_key = runtime_key
+            compressor.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token

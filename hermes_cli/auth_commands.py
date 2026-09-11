@@ -15,6 +15,7 @@ from agent.credential_pool import (
     CUSTOM_POOL_PREFIX,
     SOURCE_MANUAL,
     SOURCE_MANUAL_DEVICE_CODE,
+    STATUS_DEAD,
     STATUS_EXHAUSTED,
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
@@ -23,6 +24,7 @@ from agent.credential_pool import (
     PooledCredential,
     _exhausted_until,
     _normalize_custom_pool_name,
+    codex_identity_metadata_from_token,
     get_pool_strategy,
     label_from_token,
     list_custom_pool_providers,
@@ -396,6 +398,33 @@ def auth_add_command(args) -> None:
 
     if provider == "openai-codex":
         creds = auth_mod._codex_device_code_login()
+        identity = extract_codex_identity_metadata(creds["tokens"]["access_token"])
+        expected_account_id = str(getattr(args, "expected_account_id", "") or "").strip()
+        if expected_account_id and identity["chatgpt_account_id"] != expected_account_id:
+            raise SystemExit(
+                "Authenticated OpenAI Codex account ID does not match "
+                f"--expected-account-id ({identity['chatgpt_account_id']} != {expected_account_id}); nothing saved."
+            )
+        existing_match = None
+        for existing in pool.entries():
+            existing_account_id = str(
+                getattr(existing, "chatgpt_account_id", "") or ""
+            ).strip()
+            if not existing_account_id:
+                try:
+                    existing_account_id = extract_codex_identity_metadata(
+                        existing.access_token
+                    )["chatgpt_account_id"]
+                except ValueError:
+                    continue
+            if existing_account_id == identity["chatgpt_account_id"]:
+                existing_match = existing
+                break
+        if existing_match is not None:
+            raise SystemExit(
+                f"OpenAI Codex account {identity['chatgpt_account_id']} already exists "
+                f"as credential {existing_match.id} ({existing_match.label}); nothing saved."
+            )
         label = (getattr(args, "label", None) or "").strip() or label_from_token(
             creds["tokens"]["access_token"],
             _oauth_default_label(provider, len(pool.entries()) + 1),
@@ -421,6 +450,7 @@ def auth_add_command(args) -> None:
             refresh_token=creds["tokens"].get("refresh_token"),
             base_url=creds.get("base_url"),
             last_refresh=creds.get("last_refresh"),
+            extra=identity,
         )
         first_credential = not pool.entries()
         pool.add_entry(entry)
@@ -555,7 +585,16 @@ def auth_list_command(args) -> None:
                 marker = "← "
             status = _format_exhausted_status(entry)
             source = _display_source(entry.source)
-            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
+            identity = ""
+            account_id = str(getattr(entry, "chatgpt_account_id", "") or "").strip()
+            plan = str(getattr(entry, "chatgpt_plan_type", "") or "").strip()
+            if account_id:
+                identity = f" account={account_id}"
+            if plan:
+                identity += f" plan={plan}"
+            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{identity}{status} {marker}".rstrip())
+        if provider == "openai-codex":
+            print("  Identity and plan are local metadata from the saved OAuth JWT; use `hermes auth probe` for live verification.")
         print()
 
 
@@ -601,7 +640,64 @@ def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     pool = load_pool(provider)
     count = pool.reset_statuses()
-    print(f"Reset status on {count} {provider} credentials")
+    print(
+        f"Reset local status on {count} {provider} credentials; "
+        "this does not reauthenticate, refresh, revoke, or replace credentials."
+    )
+
+
+def extract_codex_identity_metadata(access_token: str) -> dict[str, str]:
+    """Extract the only non-secret Codex JWT claims approved for persistence."""
+    return codex_identity_metadata_from_token(access_token)
+
+
+def auth_probe_command(args) -> None:
+    """Probe one persisted Codex credential without mutating pool state."""
+    provider = _normalize_provider(getattr(args, "provider", ""))
+    if provider != "openai-codex":
+        raise SystemExit("Auth probe currently supports only openai-codex.")
+    credential_id = str(getattr(args, "credential_id", "") or "").strip()
+    store = auth_mod._load_auth_store()
+    entries = ((store.get("credential_pool") or {}).get(provider) or [])
+    payload = next(
+        (item for item in entries if isinstance(item, dict) and str(item.get("id") or "") == credential_id),
+        None,
+    )
+    if payload is None:
+        raise SystemExit(f"No openai-codex credential with id {credential_id}.")
+    entry = PooledCredential.from_dict(provider, payload)
+    if entry.last_status == STATUS_DEAD or (
+        entry.last_status == STATUS_EXHAUSTED
+        and (_exhausted_until(entry) or 0) > time.time()
+    ):
+        raise SystemExit(
+            f"Credential {credential_id} is locally unavailable; "
+            "use `hermes auth list openai-codex` for persisted status."
+        )
+    token = str(payload.get("access_token") or "")
+    identity = extract_codex_identity_metadata(token)
+    saved_account = str(payload.get("chatgpt_account_id") or "").strip()
+    if saved_account and saved_account != identity["chatgpt_account_id"]:
+        raise SystemExit("Saved account identity does not match the credential token; probe refused.")
+    import httpx
+
+    response = httpx.get(
+        "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "ChatGPT-Account-Id": identity["chatgpt_account_id"],
+            "Accept": "application/json",
+        },
+        timeout=10.0,
+    )
+    live = "ok" if response.status_code == 200 else f"failed (HTTP {response.status_code})"
+    print("provider: openai-codex")
+    print(f"credential_id: {credential_id}")
+    print(f"label: {entry.label}")
+    print("model: none (account-catalog probe)")
+    print(f"account_id: {identity['chatgpt_account_id']}")
+    print(f"plan: {identity.get('chatgpt_plan_type', 'unknown')}")
+    print(f"live: {live}")
 
 
 def auth_status_command(args) -> None:
@@ -887,6 +983,9 @@ def auth_command(args) -> None:
         return
     if action == "reset":
         auth_reset_command(args)
+        return
+    if action == "probe":
+        auth_probe_command(args)
         return
     if action == "status":
         auth_status_command(args)

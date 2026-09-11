@@ -14,6 +14,8 @@ fallback calls, contaminating primary state with fallback-provider errors.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.error_classifier import FailoverReason
+
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -155,7 +157,7 @@ class TestFallbackCredentialIsolation:
             "agent.credential_pool.load_pool",
             return_value=fallback_pool,
         ) as load_pool:
-            assert try_activate_fallback(agent) is True
+            assert try_activate_fallback(agent, FailoverReason.timeout) is True
 
         resolve_provider_client.assert_called_once()
         load_pool.assert_called_once_with("openai-codex")

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from run_agent import AIAgent
+from agent.error_classifier import FailoverReason
 
 
 def _make_agent_openrouter():
@@ -140,7 +141,7 @@ def test_fallback_activation_resets_stale_streak():
         "agent.auxiliary_client.resolve_provider_client",
         return_value=(_mock_client(), "resolved"),
     ):
-        assert agent._try_activate_fallback() is True
+        assert agent._try_activate_fallback(FailoverReason.timeout) is True
 
     assert agent._consecutive_stale_streams == 0
 
@@ -151,7 +152,7 @@ def test_fallback_exhaustion_keeps_stale_streak():
     agent = _make_fallback_agent(fallback_model=[])
     agent._consecutive_stale_streams = 7
 
-    assert agent._try_activate_fallback() is False
+    assert agent._try_activate_fallback(FailoverReason.timeout) is False
     assert agent._consecutive_stale_streams == 7
 
 

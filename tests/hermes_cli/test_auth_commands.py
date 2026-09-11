@@ -43,7 +43,15 @@ def _write_groq_provider_config(
 def _jwt_with_email(email: str) -> str:
     header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
     payload = base64.urlsafe_b64encode(
-        json.dumps({"email": email}).encode()
+        json.dumps(
+            {
+                "email": email,
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": f"acct-{email.split('@', 1)[0]}",
+                    "chatgpt_plan_type": "test",
+                },
+            }
+        ).encode()
     ).rstrip(b"=").decode()
     return f"{header}.{payload}.signature"
 
@@ -960,7 +968,7 @@ def test_seed_from_singletons_respects_hermes_pkce_suppression(tmp_path, monkeyp
     }))
 
     # Stub the readers so only hermes_pkce is "available"; claude_code returns None
-    import agent.anthropic_adapter as aa
+    import agent.anthropic_credentials as aa
     monkeypatch.setattr(aa, "read_hermes_oauth_credentials", lambda: {
         "accessToken": "tok", "refreshToken": "r", "expiresAt": 9999999999000,
     })

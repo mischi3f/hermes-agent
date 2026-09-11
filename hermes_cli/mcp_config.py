@@ -776,10 +776,7 @@ def cmd_mcp_test(args):
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
                 # Mask the value (accepts ${VAR} and Cursor-style ${env:VAR})
                 resolved = _ENV_VAR_PATTERN.sub(lambda m: os.getenv(_env_ref_name(m.group(1)), ""), v)
-                if len(resolved) > 8:
-                    masked = resolved[:4] + "***" + resolved[-4:]
-                else:
-                    masked = "***"
+                masked = "[credential redacted]" if resolved else "[not set]"
                 print(f"    {k}: {masked}")
     else:
         _info("Auth: none")
