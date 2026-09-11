@@ -8180,14 +8180,25 @@ class AIAgent:
                         return system_message or ""
 
                 def _on_timeout(idle, waited, since_progress):
-                    logger.warning(
-                        "Context compression made no progress for %.1fs "
-                        "(total wait %.1fs, ceiling %.1fs); continuing without "
-                        "compression",
-                        since_progress,
-                        waited,
-                        total_ceiling,
-                    )
+                    reached_total_ceiling = waited >= total_ceiling
+                    if reached_total_ceiling:
+                        logger.warning(
+                            "Context compression reached the %.1fs total ceiling "
+                            "after %.1fs (last progress %.1fs ago); continuing "
+                            "without compression",
+                            total_ceiling,
+                            waited,
+                            since_progress,
+                        )
+                    else:
+                        logger.warning(
+                            "Context compression made no progress for %.1fs "
+                            "(total wait %.1fs, ceiling %.1fs); continuing without "
+                            "compression",
+                            since_progress,
+                            waited,
+                            total_ceiling,
+                        )
                     touch = getattr(self, "_touch_activity", None)
                     if callable(touch):
                         try:
@@ -8208,7 +8219,9 @@ class AIAgent:
                         if callable(record):
                             try:
                                 record(
-                                    "host compress_context timeout "
+                                    "host compress_context total ceiling"
+                                    if reached_total_ceiling
+                                    else "host compress_context timeout "
                                     "(no summary progress)"
                                 )
                             except Exception:
@@ -8219,10 +8232,21 @@ class AIAgent:
                                 )
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
+                        if reached_total_ceiling:
+                            warning = (
+                                "⚠ Context compression reached the "
+                                f"{total_ceiling:.1f}s total ceiling while the "
+                                "summary model was still making progress. "
+                            )
+                        else:
+                            warning = (
+                                "⚠ Context compression timed out "
+                                f"after {idle:.1f}s with no output from the summary "
+                                "model. "
+                            )
                         emit(
-                            "⚠ Context compression timed out "
-                            f"after {idle:.1f}s with no output from the summary "
-                            "model. No messages were dropped — continuing without "
+                            warning
+                            + "No messages were dropped — continuing without "
                             "compression. Run /compress to retry, /new for a clean "
                             "session, or check auxiliary.compression."
                         )

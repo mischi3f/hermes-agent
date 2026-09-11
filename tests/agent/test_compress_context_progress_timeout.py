@@ -438,6 +438,53 @@ class TestCompressContextForwarderOwnsTimeout:
             provenance=ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
         )
 
+    def test_total_ceiling_warning_does_not_claim_no_output(self, monkeypatch):
+        """Progress until the total ceiling must not be reported as idle timeout."""
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent.session_id = "s1"
+        agent._cached_system_prompt = "sys"
+        agent._emit_warning = MagicMock()
+        agent._touch_activity = MagicMock()
+        agent._build_system_prompt = MagicMock(return_value="sys")
+        agent._conversation_root_id = MagicMock(return_value=None)
+        agent.context_compressor = MagicMock()
+        agent.context_compressor._consecutive_timeout_failures = 0
+        agent.context_compressor._record_compression_failure_cooldown = MagicMock()
+
+        release = threading.Event()
+
+        def progressing_compress(agent_obj, messages, system_message, **kwargs):
+            fence = kwargs["commit_fence"]
+            while not release.wait(timeout=0.02):
+                fence.touch_progress()
+            return messages, system_message
+
+        monkeypatch.setattr(
+            "agent.conversation_compression.compress_context",
+            progressing_compress,
+        )
+        monkeypatch.setattr(
+            "agent.conversation_compression.resolve_context_compression_timeouts",
+            lambda compression_cfg=None: (0.05, 0.12),
+        )
+        monkeypatch.setattr(
+            "agent.portal_tags.get_conversation_context",
+            lambda: object(),
+        )
+
+        original = [{"role": "user", "content": "stay"}]
+        out_msgs, out_prompt = AIAgent._compress_context(agent, original, "sys")
+        release.set()
+
+        assert out_msgs is original
+        assert out_prompt == "sys"
+        warning = agent._emit_warning.call_args.args[0]
+        assert "total ceiling" in warning
+        assert "0.1s" in warning
+        assert "no output" not in warning
+
     def test_fallback_prompt_resolved_lazily_on_timeout(self, monkeypatch):
         """Eager prompt rebuild must not run before compression starts."""
         from run_agent import AIAgent
