@@ -4,6 +4,8 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
+import threading
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -89,6 +91,116 @@ class TestBoundedOutputCollector:
         assert rendered.endswith("[Command timed out after 1s]")
         assert "[OUTPUT TRUNCATED" in rendered
 
+    def test_request_secret_split_across_chunks_is_redacted_before_spill(self, tmp_path):
+        secret = "opaque-request-secret-value"
+        spill = tmp_path / "split.log"
+        collector = _BoundedOutputCollector(
+            24, spill_path=spill, redaction_values=(secret,))
+
+        collector.append("head-" + "x" * 40)
+        collector.append("opaque-request-")
+        collector.append("secret-value-tail")
+        collector.finish()
+
+        rendered = collector.render()
+        collector.close_spill()
+        spilled = spill.read_text(encoding="utf-8")
+        assert secret not in rendered
+        assert secret not in spilled
+        assert "redacted-request-secret" in spilled
+        assert spilled.endswith("-tail")
+
+    def test_concurrent_observer_never_sees_request_secret_in_live_spill(self, tmp_path):
+        secret = "observer-visible-request-credential"
+        spill = tmp_path / "observed.log"
+        collector = _BoundedOutputCollector(
+            16, spill_path=spill, redaction_values=(secret,))
+        stop = threading.Event()
+        sample_requested = threading.Event()
+        sample_complete = threading.Event()
+        observed = []
+
+        def observe():
+            while not stop.is_set():
+                if not sample_requested.wait(timeout=1):
+                    continue
+                sample_requested.clear()
+                observed.append(
+                    spill.read_text(encoding="utf-8", errors="replace") if spill.exists() else "")
+                sample_complete.set()
+
+        def sample_live_spill():
+            sample_complete.clear()
+            sample_requested.set()
+            assert sample_complete.wait(timeout=2)
+
+        watcher = threading.Thread(target=observe)
+        watcher.start()
+        try:
+            collector.append("overflow-" + "p" * 30)
+            sample_live_spill()
+            for piece in ("observer-visible-", "request-", "credential"):
+                collector.append(piece)
+                sample_live_spill()
+            collector.finish()
+            sample_live_spill()
+        finally:
+            collector.close_spill()
+            stop.set()
+            sample_requested.set()
+            watcher.join(timeout=2)
+
+        observed.append(spill.read_text(encoding="utf-8"))
+        assert observed
+        assert all(secret not in snapshot for snapshot in observed)
+        assert "redacted-request-secret" in observed[-1]
+
+    def test_exception_close_path_never_persists_raw_request_secret(self, tmp_path):
+        secret = "crash-path-request-credential"
+        spill = tmp_path / "crash.log"
+        collector = _BoundedOutputCollector(
+            12, spill_path=spill, redaction_values=(secret,))
+
+        try:
+            collector.append("overflow-" + "z" * 30)
+            collector.append("crash-path-request-")
+            collector.append("credential")
+            raise RuntimeError("simulated wait failure")
+        except RuntimeError:
+            collector.close_spill()
+
+        persisted = spill.read_text(encoding="utf-8")
+        assert secret not in persisted
+        assert "redacted-request-secret" in persisted
+
+    def test_collectors_capture_request_redaction_values_without_cross_request_bleed(self, tmp_path):
+        secret_a = "request-a-private-value"
+        secret_b = "request-b-private-value"
+        collector_a = _BoundedOutputCollector(
+            12, spill_path=tmp_path / "a.log", redaction_values=(secret_a,))
+        collector_b = _BoundedOutputCollector(
+            12, spill_path=tmp_path / "b.log", redaction_values=(secret_b,))
+
+        def write(collector, own_secret, foreign_secret):
+            collector.append("overflow-padding-")
+            collector.append(f"own={own_secret}; foreign={foreign_secret}")
+            collector.finish()
+            collector.close_spill()
+
+        threads = [
+            threading.Thread(target=write, args=(collector_a, secret_a, secret_b)),
+            threading.Thread(target=write, args=(collector_b, secret_b, secret_a)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        spilled_a = Path(tmp_path / "a.log").read_text(encoding="utf-8")
+        spilled_b = Path(tmp_path / "b.log").read_text(encoding="utf-8")
+        assert secret_a not in spilled_a and secret_b in spilled_a
+        assert secret_b not in spilled_b and secret_a in spilled_b
+
 
 class TestWrapCommand:
     def test_basic_shape(self):
@@ -119,6 +231,27 @@ class TestWrapCommand:
         wrapped = env._wrap_command("echo 'hello world'", "/tmp")
 
         assert "eval 'echo '\\''hello world'\\'''" in wrapped
+
+    def test_request_scoped_command_sources_but_never_commits_snapshot(self):
+        from gateway.request_runtime_env import (
+            bind_request_runtime_env, reset_request_runtime_env, terminal_command_spawn_scope,
+        )
+
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        token = bind_request_runtime_env({"GH_TOKEN": "request-secret"})
+        try:
+            with terminal_command_spawn_scope():
+                wrapped = env._wrap_command(
+                    "export COPIED_REQUEST_SECRET=$GH_TOKEN; alias leak='echo $GH_TOKEN'", "/tmp")
+        finally:
+            reset_request_runtime_env(token)
+
+        assert "source" in wrapped
+        assert "eval 'export COPIED_REQUEST_SECRET=$GH_TOKEN" in wrapped
+        assert "export -p" not in wrapped
+        assert "mktemp" not in wrapped
+        assert "mv -f" not in wrapped
 
 
     def test_cd_failure_exit_126(self):

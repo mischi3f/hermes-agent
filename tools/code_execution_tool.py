@@ -672,6 +672,14 @@ def execute_code(
     the security envelope (env scrubbing, tool whitelist + call budget, output redaction), not an
     isolation jail: default `project` mode runs in the session's cwd with the project venv.
     ``enabled_tools`` ∩ SANDBOX_ALLOWED_TOOLS; ``reset`` kills the existing kernel first."""
+    # A persistent/interpreter child can double-fork or create a new session and outlive
+    # kernel cleanup. Request credentials therefore never enter execute_code at all.
+    from gateway.request_runtime_env import current_request_runtime_env
+    if current_request_runtime_env():
+        return tool_error(
+            "execute_code is disabled while a request-scoped environment is bound; "
+            "use terminal or direct tool calls instead. No code or backend was started."
+        )
     if not SANDBOX_AVAILABLE:
         return tool_error("execute_code sandbox is unavailable in this environment. "
                           "Use normal tool calls (terminal, read_file, write_file, ...) instead.")

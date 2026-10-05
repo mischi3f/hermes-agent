@@ -890,6 +890,9 @@ def handle_function_call(
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
+        from agent.redact import redact_request_scoped_payload
+        result = redact_request_scoped_payload(result)
+        extra = redact_request_scoped_payload(extra)
         _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
                                   **asdict(ids), middleware_trace=list(trace), **extra)
         return result
@@ -950,12 +953,19 @@ def handle_function_call(
         result = _execute_tool(function_name, function_args, original_args, ids, user_task=user_task,
                                enabled_tools=enabled_tools, skip_tool_execution_middleware=skip_tool_execution_middleware)
         duration_ms = _elapsed_ms(start)
-        _emit(result, duration_ms=duration_ms)
-        return _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
+        result = _emit(result, duration_ms=duration_ms)
+        transformed = _apply_transform_tool_result_hook(function_name, function_args, result, duration_ms, ids)
+        from agent.redact import redact_request_scoped_payload
+        return redact_request_scoped_payload(transformed)
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
-        logger.exception(error_msg)
+        from gateway.request_runtime_env import current_request_redaction_values
+        if current_request_redaction_values():
+            from agent.redact import redact_request_scoped_values
+            logger.error("%s", redact_request_scoped_values(error_msg))
+        else:
+            logger.exception(error_msg)
         return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),
                      status="error", error_type=type(e).__name__, error_message=str(e))
 

@@ -25,6 +25,65 @@ _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 _SPILL_MAX_AGE_S = 7 * 86400
 
+_REQUEST_SECRET_MARKER = "«redacted-request-secret»"
+
+
+class _ExactValueStreamRedactor:
+    """Exact-value streaming scrubber that never emits a possible secret prefix.
+
+    The final ``max_secret_length - 1`` characters stay in this private overlap
+    buffer until another chunk arrives (or :meth:`finish` is called). Thus a
+    credential split across arbitrary ``os.read`` boundaries is replaced before
+    the collector's retained window or spill file can receive any part that could
+    later join into the original value.
+    """
+
+    def __init__(self, values) -> None:
+        self._values = tuple(sorted(
+            {value for value in values if isinstance(value, str) and value},
+            key=len,
+            reverse=True,
+        ))
+        self._max_length = max((len(value) for value in self._values), default=0)
+        self._pending = ""
+        self._finished = False
+
+    def _consume(self, limit: int) -> str:
+        emitted: list[str] = []
+        cursor = 0
+        while cursor < limit:
+            positions = (
+                (position, -len(value), value)
+                for value in self._values
+                if (position := self._pending.find(value, cursor)) != -1
+            )
+            match = min(positions, default=None)
+            if match is None or match[0] >= limit:
+                emitted.append(self._pending[cursor:limit])
+                cursor = limit
+                break
+            position, _negative_length, value = match
+            emitted.append(self._pending[cursor:position])
+            emitted.append(_REQUEST_SECRET_MARKER)
+            cursor = position + len(value)
+        self._pending = self._pending[cursor:]
+        return "".join(emitted)
+
+    def feed(self, text: str) -> str:
+        if self._finished:
+            raise RuntimeError("request output redactor already finished")
+        if not text:
+            return ""
+        self._pending += text
+        safe_limit = len(self._pending) - max(0, self._max_length - 1)
+        return self._consume(max(0, safe_limit))
+
+    def finish(self) -> str:
+        if self._finished:
+            return ""
+        self._finished = True
+        return self._consume(len(self._pending))
+
 
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text. When ``spill_path`` is set,
@@ -34,7 +93,9 @@ class _BoundedOutputCollector:
     # Hard ceiling on spill file size; protects disk from runaway output.
     _SPILL_CAP_CHARS = 5_000_000
 
-    def __init__(self, max_chars: int, spill_path: "Path | None" = None):
+    def __init__(
+        self, max_chars: int, spill_path: "Path | None" = None, *, redaction_values=(),
+    ):
         self.max_chars = max(1, int(max_chars))
         self._head_limit = int(self.max_chars * 0.4)
         self._tail_limit = self.max_chars - self._head_limit
@@ -48,6 +109,9 @@ class _BoundedOutputCollector:
         self._spill_fh: IO[str] | None = None
         self._spill_chars = 0
         self._spill_capped = False
+        self._stream_redactor = (
+            _ExactValueStreamRedactor(redaction_values) if redaction_values else None)
+        self._stream_finished = False
 
     def _maybe_spill(self, text: str) -> None:
         """Tee ``text`` to the spill file (opened lazily on first overflow)."""
@@ -56,8 +120,8 @@ class _BoundedOutputCollector:
         try:
             if self._spill_fh is None:
                 from tools.spill_safety import ensure_spill_dir, open_exclusive
-                # Raw pre-redaction output: private perms + symlink-refusing
-                # exclusive create (a planted link must fail, never redirect).
+                # Output has already passed request-scoped exact-value redaction;
+                # private perms and exclusive create remain defense in depth.
                 ensure_spill_dir(self._spill_path.parent, private=True)
                 self._spill_fh = open_exclusive(self._spill_path, private=True, errors="replace")
                 # Backfill what's retained so the file holds the stream from byte 0.
@@ -72,6 +136,7 @@ class _BoundedOutputCollector:
             else:
                 self._spill_fh.write(text)
             self._spill_chars += len(text)
+            self._spill_fh.flush()
         except OSError:
             # Disk trouble must never break command execution.
             self._spill_capped = True
@@ -79,6 +144,7 @@ class _BoundedOutputCollector:
     def close_spill(self) -> "str | None":
         """Close the spill file and return its path if it was used."""
         with self._lock:
+            self._finish_locked()
             if self._spill_fh is None:
                 return None
             try:
@@ -87,6 +153,23 @@ class _BoundedOutputCollector:
                 pass
             self._spill_fh = None
             return str(self._spill_path)
+
+    def _finish_locked(self) -> None:
+        if self._stream_finished:
+            return
+        self._stream_finished = True
+        if self._stream_redactor is None:
+            return
+        try:
+            tail = self._stream_redactor.finish()
+        except Exception:
+            tail = "[request output redaction failed]"
+        self._append_safe_locked(tail)
+
+    def finish(self) -> None:
+        """Flush the redactor's overlap after the process can emit no more bytes."""
+        with self._lock:
+            self._finish_locked()
 
     @property
     def buffered_chars(self) -> int:
@@ -102,41 +185,55 @@ class _BoundedOutputCollector:
         if not text:
             return
         with self._lock:
-            text_len = len(text)
-            # Spill tee activates at the first overflow, then mirrors every chunk.
-            if self._spill_path is not None and (
-                self._spill_fh is not None or self._total_chars + text_len > self.max_chars):
-                self._maybe_spill(text)
-            self._total_chars += text_len
-            start = 0
+            if self._stream_finished:
+                raise RuntimeError("cannot append after output collector finish")
+            if self._stream_redactor is not None:
+                try:
+                    text = self._stream_redactor.feed(text)
+                except Exception:
+                    text = "[request output redaction failed]"
+                    self._stream_finished = True
+            self._append_safe_locked(text)
 
-            if self._head_chars < self._head_limit:
-                take = min(self._head_limit - self._head_chars, text_len)
-                if take:
-                    self._head.append(text[:take])
-                    self._head_chars += take
-                    start = take
+    def _append_safe_locked(self, text: str) -> None:
+        """Store text already cleared for retention/spill. Caller holds ``_lock``."""
+        if not text:
+            return
+        text_len = len(text)
+        # Spill tee activates at the first overflow, then mirrors every chunk.
+        if self._spill_path is not None and (
+            self._spill_fh is not None or self._total_chars + text_len > self.max_chars):
+            self._maybe_spill(text)
+        self._total_chars += text_len
+        start = 0
 
-            remaining = text_len - start
-            if remaining <= 0 or self._tail_limit <= 0:
-                return
-            if remaining >= self._tail_limit:
-                self._tail.clear()
-                self._tail.append(text[-self._tail_limit :])
-                self._tail_chars = self._tail_limit
-                return
+        if self._head_chars < self._head_limit:
+            take = min(self._head_limit - self._head_chars, text_len)
+            if take:
+                self._head.append(text[:take])
+                self._head_chars += take
+                start = take
 
-            chunk = text[start:]
-            self._tail.append(chunk)
-            self._tail_chars += len(chunk)
-            while (excess := self._tail_chars - self._tail_limit) > 0:
-                first = self._tail[0]
-                if len(first) <= excess:
-                    self._tail.popleft()
-                    self._tail_chars -= len(first)
-                else:
-                    self._tail[0] = first[excess:]
-                    self._tail_chars -= excess
+        remaining = text_len - start
+        if remaining <= 0 or self._tail_limit <= 0:
+            return
+        if remaining >= self._tail_limit:
+            self._tail.clear()
+            self._tail.append(text[-self._tail_limit :])
+            self._tail_chars = self._tail_limit
+            return
+
+        chunk = text[start:]
+        self._tail.append(chunk)
+        self._tail_chars += len(chunk)
+        while (excess := self._tail_chars - self._tail_limit) > 0:
+            first = self._tail[0]
+            if len(first) <= excess:
+                self._tail.popleft()
+                self._tail_chars -= len(first)
+            else:
+                self._tail[0] = first[excess:]
+                self._tail_chars -= excess
 
     def render(self, *, suffix: str = "") -> str:
         """Render within ``max_chars``, preserving a required status suffix."""
@@ -172,8 +269,14 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
     spill file under ``$HERMES_HOME/cache/terminal-output`` (created only on actual overflow;
     spills older than 7 days are pruned opportunistically). Otherwise the collector is
     effectively unbounded so internal consumers keep full-fidelity output."""
+    try:
+        from gateway.request_runtime_env import current_request_redaction_values
+        redaction_values = current_request_redaction_values()
+    except Exception:
+        redaction_values = ()
     if not bounded_capture:
-        return _BoundedOutputCollector(_UNBOUNDED_CAPTURE_CHARS)
+        return _BoundedOutputCollector(
+            _UNBOUNDED_CAPTURE_CHARS, redaction_values=redaction_values)
     try:
         from tools.tool_output_limits import get_max_bytes
         capture_limit = get_max_bytes()
@@ -193,7 +296,8 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
                     pass
     except Exception:
         spill_path = None
-    return _BoundedOutputCollector(capture_limit, spill_path=spill_path)
+    return _BoundedOutputCollector(
+        capture_limit, spill_path=spill_path, redaction_values=redaction_values)
 
 
 def _finalize_wait_result(collector: _BoundedOutputCollector, rendered: str, returncode: int | None) -> dict:

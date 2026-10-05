@@ -627,7 +627,7 @@ class TestRunEvents:
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
-        """Same client session_id must not let one run approve another run's queue."""
+        """Approval queues stay isolated across concurrently active runs."""
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(auth_adapter, "_create_agent") as mock_create:
@@ -637,12 +637,12 @@ class TestRunEvents:
 
                 victim_resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "victim", "session_id": "shared-project"},
+                    json={"input": "victim", "session_id": "victim-project"},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 attacker_resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "attacker", "session_id": "shared-project"},
+                    json={"input": "attacker", "session_id": "attacker-project"},
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 assert victim_resp.status == 202

@@ -673,8 +673,13 @@ def _make_run_env(env: dict) -> dict:
     the LAUNCH profile's; under a routed home override its ``.env`` residue is dropped first
     (``strip_launch_profile_env``, a no-op for the launch profile) so the backend's own ``env``
     and the served profile's declared passthrough names are what the child sees."""
-    return _scrubbed_env([(dict(strip_launch_profile_env(os.environ.copy()) | env), True)], frozenset(),
-                         lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    run_env = _scrubbed_env([(dict(strip_launch_profile_env(os.environ.copy()) | env), True)], frozenset(),
+                            lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    # Request runtime values are a terminal-only, per-command overlay. They must not ride the
+    # shared subprocess finalizer: browser/search/ACP children use that path too.
+    from gateway.request_runtime_env import current_terminal_runtime_env
+    run_env.update(current_terminal_runtime_env())
+    return run_env
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---
@@ -930,8 +935,22 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        run_env = _make_run_env(self.env)
+        from gateway.request_runtime_env import current_terminal_runtime_env
+        if current_terminal_runtime_env():
+            # Process groups cannot contain a descendant after it calls setsid().
+            # Keep a command-private Linux subreaper above bash so orphaned/double-
+            # forked children remain scoped descendants until it freezes and kills
+            # them. Unsupported hosts fail before a credential-bearing child starts.
+            if sys.platform != "linux":
+                raise RuntimeError(
+                    "request-scoped local terminal commands require Linux subreaper cleanup")
+            supervisor = Path(__file__).with_name("request_subreaper.py")
+            if not supervisor.is_file():
+                raise RuntimeError("request-scoped local terminal subreaper is unavailable")
+            args = [sys.executable, str(supervisor), "--", *args]
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,

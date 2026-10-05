@@ -7,6 +7,7 @@ last 4 characters for debuggability.
 import logging
 import os
 import re
+from collections.abc import Mapping
 import shlex
 import threading
 from urllib.parse import unquote_plus
@@ -74,6 +75,209 @@ def redact_registered_vault_values(text: str) -> str:
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
     return text
+
+
+def redact_request_scoped_values(text: str, *, values=None) -> str:
+    """Scrub exact credential values registered by the current API request context."""
+    if not isinstance(text, str) or not text:
+        return text
+    if values is None:
+        try:
+            from gateway.request_runtime_env import current_request_redaction_values
+            values = current_request_redaction_values()
+        except Exception:
+            values = ()
+    for value in values:
+        if value in text:
+            text = text.replace(value, "«redacted-request-secret»")
+    return text
+
+
+class RequestScopedStreamingRedactor:
+    """Exact-value redaction for text delivered in independently emitted chunks.
+
+    A suffix that could still become a request secret is retained until a later
+    chunk proves or completes it.  Complete values are replaced before any part
+    of them is returned, so concatenating all emitted chunks cannot reconstruct
+    a credential that crossed a callback/SSE boundary.
+    """
+
+    _MARKER = "«redacted-request-secret»"
+
+    def __init__(self, values=None):
+        self._lock = threading.RLock()
+        self._pending = ""
+        self._values: tuple[str, ...] = ()
+        self.reset(values)
+
+    @staticmethod
+    def _normalize_values(values) -> tuple[str, ...]:
+        return tuple(sorted(
+            {value for value in (values or ()) if isinstance(value, str) and value},
+            key=len,
+            reverse=True,
+        ))
+
+    def reset(self, values=None) -> None:
+        """Clear buffered text and install a fresh request's exact values."""
+        if values is None:
+            try:
+                from gateway.request_runtime_env import current_request_redaction_values
+                values = current_request_redaction_values()
+            except Exception:
+                values = ()
+        with self._lock:
+            self._pending = ""
+            self._values = self._normalize_values(values)
+
+    def _tail_length(self, text: str) -> int:
+        """Longest suffix of *text* that is a proper prefix of any secret."""
+        longest = 0
+        for secret in self._values:
+            upper = min(len(text), len(secret) - 1)
+            for length in range(upper, longest, -1):
+                if text.endswith(secret[:length]):
+                    longest = length
+                    break
+        return longest
+
+    def _drain(self, *, final: bool) -> str:
+        text = self._pending
+        output: list[str] = []
+        while text:
+            found_at = None
+            found_secret = ""
+            for secret in self._values:
+                index = text.find(secret)
+                if index >= 0 and (
+                    found_at is None or index < found_at
+                    or (index == found_at and len(secret) > len(found_secret))
+                ):
+                    found_at = index
+                    found_secret = secret
+            if found_at is None:
+                keep = 0 if final else self._tail_length(text)
+                emit_to = len(text) - keep
+                output.append(text[:emit_to])
+                self._pending = text[emit_to:]
+                break
+            output.append(text[:found_at])
+            output.append(self._MARKER)
+            text = text[found_at + len(found_secret):]
+        else:
+            self._pending = ""
+        return "".join(output)
+
+    def feed(self, chunk: str) -> str:
+        """Return the safe portion of *chunk* plus any now-resolved prior tail."""
+        if not isinstance(chunk, str) or not chunk:
+            return chunk
+        with self._lock:
+            if not self._values:
+                return chunk
+            self._pending += chunk
+            return self._drain(final=False)
+
+    def flush(self) -> str:
+        """Safely emit the remaining non-secret tail at stream end or error."""
+        with self._lock:
+            if not self._pending:
+                return ""
+            return self._drain(final=True)
+
+
+def redact_request_scoped_payload(value, *, values=None, _seen=None):
+    """Return a recursively exact-scrubbed logging/payload copy, including mapping keys.
+
+    The caller's containers are never mutated. Cycles are replaced with a fixed marker rather
+    than recursed forever, and uncommon objects are reduced to their scrubbed string form so a
+    custom ``__str__``/``__repr__`` cannot reintroduce a request credential at format time.
+    """
+    if values is None:
+        try:
+            from gateway.request_runtime_env import current_request_redaction_values
+            values = current_request_redaction_values()
+        except Exception:
+            values = ()
+    values = tuple(values)
+    if isinstance(value, str):
+        return redact_request_scoped_values(value, values=values)
+    if isinstance(value, bytes):
+        result = value
+        marker = "«redacted-request-secret»".encode()
+        for secret in values:
+            encoded = secret.encode()
+            if encoded:
+                result = result.replace(encoded, marker)
+        return result
+    if value is None or isinstance(value, (bool, int, float, complex)):
+        return value
+
+    if _seen is None:
+        _seen = set()
+    identity = id(value)
+    if identity in _seen:
+        return "«redacted-recursive-value»"
+    _seen.add(identity)
+    try:
+        if isinstance(value, Mapping):
+            return {
+                redact_request_scoped_payload(key, values=values, _seen=_seen):
+                redact_request_scoped_payload(item, values=values, _seen=_seen)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                redact_request_scoped_payload(item, values=values, _seen=_seen)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                redact_request_scoped_payload(item, values=values, _seen=_seen)
+                for item in value
+            )
+        if isinstance(value, set):
+            return {
+                redact_request_scoped_payload(item, values=values, _seen=_seen)
+                for item in value
+            }
+        if isinstance(value, frozenset):
+            return frozenset(
+                redact_request_scoped_payload(item, values=values, _seen=_seen)
+                for item in value
+            )
+        return redact_request_scoped_values(str(value), values=values)
+    finally:
+        _seen.remove(identity)
+
+
+def redact_request_scoped_log_record(record: logging.LogRecord, *, values) -> logging.LogRecord:
+    """Scrub one request-owned record before any handler sees it.
+
+    This intentionally mutates only the newly-created record for the active ContextVar scope;
+    caller-owned structured values are copied by :func:`redact_request_scoped_payload`.
+    """
+    values = tuple(values)
+    if not values:
+        return record
+
+    original = dict(record.__dict__)
+    record.__dict__.clear()
+    for key, value in original.items():
+        if key == "exc_info":
+            continue
+        safe_key = redact_request_scoped_values(key, values=values)
+        record.__dict__[safe_key] = redact_request_scoped_payload(value, values=values)
+
+    exc_info = original.get("exc_info")
+    if exc_info:
+        _exc_type, exc, traceback = exc_info
+        safe_exc = RuntimeError(redact_request_scoped_values(str(exc), values=values))
+        record.exc_info = (RuntimeError, safe_exc, traceback)
+        record.exc_text = None
+    else:
+        record.exc_info = None
+    return record
 
 # Sensitive query-string param names (case-insensitive): opaque tokens / OAuth
 # codes / pre-signed signatures with no vendor prefix.
@@ -904,7 +1108,9 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     text = text if isinstance(text, str) else str(text)
     if not text:
         return text
-    # Vault secrets are a hard model-egress boundary: scrubbed regardless of the redact_secrets preference.
+    # Request and vault secrets are hard model-egress boundaries: scrubbed regardless
+    # of the redact_secrets preference.
+    text = redact_request_scoped_values(text)
     text = redact_registered_vault_values(text)
     if not (force or _redact_enabled()):
         return text

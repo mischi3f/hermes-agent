@@ -126,7 +126,8 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
-    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str) -> str:
+    passthrough_names: Iterable[str], snapshot_ready: bool, persist_snapshot: bool = True,
+    cwd_marker: str) -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``source`` stdout goes to /dev/null because macOS bash 3.2 / some Homebrew builds echo
     ``declare -x`` lines when sourcing. AI_AGENT/HERMES_AGENT advertise the harness to remote
@@ -151,7 +152,7 @@ def _wrap_command_script(
         f"eval '{escaped}'",
         "__hermes_ec=$?",
         "umask 077"]
-    if snapshot_ready:
+    if snapshot_ready and persist_snapshot:
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
             f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "

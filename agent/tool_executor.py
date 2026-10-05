@@ -1039,6 +1039,8 @@ def _commit_tool_result(
     Returns ``(persisted_result, display_result, risk_metadata)`` (``display_result`` =
     pre-persist content for UI previews) or ``None`` when the flush failed (stop the batch).
     """
+    from agent.redact import redact_request_scoped_payload
+    function_result = redact_request_scoped_payload(function_result)
     function_name, function_args, tool_call_id, effective_task_id = ref.name, ref.args, ref.call_id, ref.task_id
     if observed:
         if not blocked:
