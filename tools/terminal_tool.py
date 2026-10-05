@@ -848,7 +848,7 @@ def _fatal_error_json(e: BaseException) -> str:
     """
     import traceback
     tb_str = traceback.format_exc()
-    logger.error("terminal_tool exception:\n%s", tb_str)
+    logger.error("terminal_tool exception:\n%s", _redact_terminal_error_text(tb_str))
     return json.dumps({
         "output": "",
         "exit_code": -1,
@@ -1097,6 +1097,9 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
 
 def _yield_kwargs(command: str, **ctx) -> dict:
     """``env.execute`` kwargs enabling yield-to-background (local backend only)."""
+    from gateway.request_runtime_env import current_request_runtime_env
+    if current_request_runtime_env():
+        return {}
     handler = yield_to_background_handler(command=command, **ctx)
     return {"yield_handler": handler} if handler is not None else {}
 
@@ -1127,11 +1130,13 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
-            result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
-            )
+            from gateway.request_runtime_env import terminal_command_spawn_scope
+            with terminal_command_spawn_scope():
+                result = env.execute(
+                    command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                    **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
+                                    task_id=task_id, session_key=session_key),
+                )
             break
         except Exception as e:
             if "timeout" in str(e).lower():
@@ -1254,6 +1259,13 @@ def terminal_tool(
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
+        from gateway.request_runtime_env import current_request_runtime_env
+        if current_request_runtime_env() and plan.env_type != "local":
+            raise _Rejected(_error_json(
+                "Request-scoped environment is supported only by the local terminal backend; "
+                f"the configured {plan.env_type} backend was not started.",
+                status="error",
+            ))
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
@@ -1305,6 +1317,13 @@ def terminal_tool(
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
         if background:
+            from gateway.request_runtime_env import current_request_runtime_env
+            if current_request_runtime_env():
+                raise _Rejected(_error_json(
+                    "Request-scoped environment is limited to foreground terminal commands; "
+                    "background execution and foreground-to-background handoff are disabled.",
+                    status="error",
+                ))
             result = spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,

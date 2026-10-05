@@ -140,8 +140,57 @@ def _install_session_record_factory() -> None:
     logging.setLogRecordFactory(_session_record_factory)
 
 
-# Install on import so session_tag exists on all records even before setup_logging().
+def _install_request_redacting_make_record() -> None:
+    """Scrub request credentials after ``extra`` is attached and before handler emission.
+
+    A LogRecord factory runs too early: ``Logger.makeRecord`` adds structured ``extra`` fields
+    only after the factory returns. Wrapping this method gives one process-wide boundary that
+    covers normal messages, args, tracebacks, command previews, and arbitrary structured extras.
+    The wrapper is inert for records outside a request ContextVar, so concurrent/unrelated logs
+    are neither mutated nor taught another request's credential values.
+    """
+    current_make_record = logging.Logger.makeRecord
+    if getattr(current_make_record, "_hermes_request_redactor", False):
+        return
+
+    def _request_redacting_make_record(self, *args, **kwargs):
+        record = current_make_record(self, *args, **kwargs)
+        from gateway.request_runtime_env import current_request_redaction_values
+
+        values = current_request_redaction_values()
+        if not values:
+            return record
+        try:
+            from agent.redact import redact_request_scoped_log_record
+
+            return redact_request_scoped_log_record(record, values=values)
+        except Exception:
+            # Redaction itself must fail closed: dropping diagnostic detail is preferable to
+            # emitting a request credential. Preserve only routing metadata handlers require.
+            preserved = {
+                key: record.__dict__.get(key)
+                for key in ("name", "levelno", "levelname", "pathname", "filename", "module",
+                            "lineno", "funcName", "created", "msecs", "relativeCreated",
+                            "thread", "threadName", "process", "processName", "session_tag",
+                            "hermes_home")
+                if key in record.__dict__
+            }
+            record.__dict__.clear()
+            record.__dict__.update(preserved)
+            record.msg = "request-scoped log redaction failed; diagnostic suppressed"
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+            return record
+
+    _request_redacting_make_record._hermes_request_redactor = True  # type: ignore[attr-defined]
+    logging.Logger.makeRecord = _request_redacting_make_record
+
+
+# Install on import so session tags and request redaction cover records emitted before setup_logging().
 _install_session_record_factory()
+_install_request_redacting_make_record()
 
 
 class _ComponentFilter(logging.Filter):

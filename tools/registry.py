@@ -30,6 +30,8 @@ _MAX_LOGGED_ERROR_CHARS = 8192
 
 def _bound_error_text(text: str) -> str:
     """Bound an error body destined for model context; logs keep a longer prefix."""
+    from agent.redact import redact_request_scoped_values
+    text = redact_request_scoped_values(text)
     if len(text) <= _MAX_TOOL_ERROR_CHARS:
         return text
     logger.debug(
@@ -892,7 +894,13 @@ class ToolRegistry:
             return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
-            logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
+            from gateway.request_runtime_env import current_request_redaction_values
+            if current_request_redaction_values():
+                logger.error(
+                    "Tool %s dispatch error (%s): %s",
+                    name, type(e).__name__, _bound_error_text(str(e)))
+            else:
+                logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
             # Sanitize so framing tokens/CDATA/fences in exception text aren't structural noise.
             raw = f"Tool execution failed: {type(e).__name__}: {e}"
             try:
@@ -1004,7 +1012,11 @@ registry = ToolRegistry()
 def tool_error(message, **extra) -> str:
     """``'{"error": "<message>", **extra}'`` — the error body is bounded so a raw
     exception can't bloat history across retries."""
-    return json.dumps({"error": _bound_error_text(str(message)), **extra}, ensure_ascii=False)
+    from agent.redact import redact_request_scoped_payload
+    return json.dumps(
+        redact_request_scoped_payload({"error": _bound_error_text(str(message)), **extra}),
+        ensure_ascii=False,
+    )
 
 
 def tool_result(data=None, **kwargs) -> str:

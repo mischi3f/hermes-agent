@@ -301,6 +301,80 @@ def test_transfer_under_profile_home_override_targets_acquisition_registry(
     assert [entry["session_id"] for entry in entries] == ["after"]
 
 
+def test_rotation_fence_holds_all_logical_session_ids_until_release(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    lease, refusal = active_sessions.try_acquire_active_session(
+        session_id="conversation-root", surface="api_server", config={}
+    )
+    assert lease is not None and refusal is None
+
+    rollback = active_sessions.fence_active_session_rotation(
+        lease, session_id="conversation-tip"
+    )
+    assert rollback is not None
+    for session_id in ("conversation-root", "conversation-tip"):
+        contender, message = active_sessions.try_acquire_active_session(
+            session_id=session_id, surface="desktop", config={}
+        )
+        assert contender is None
+        assert getattr(message, "reason", None) == active_sessions.SESSION_NOT_OWNED
+
+    lease.release()
+    for session_id in ("conversation-root", "conversation-tip"):
+        reused, refusal = active_sessions.try_acquire_active_session(
+            session_id=session_id, surface="desktop", config={}
+        )
+        assert reused is not None and refusal is None
+        reused.release()
+
+
+def test_rotation_fence_and_competing_acquire_have_no_transfer_gap(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    lease, refusal = active_sessions.try_acquire_active_session(
+        session_id="race-root", surface="api_server", config={}
+    )
+    assert lease is not None and refusal is None
+    write_entered = threading.Event()
+    allow_write = threading.Event()
+    real_write = active_sessions._write_entries
+
+    def paused_write(path, entries):
+        if any("race-tip" in entry.get("session_ids", []) for entry in entries):
+            write_entered.set()
+            assert allow_write.wait(timeout=5)
+        return real_write(path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", paused_write)
+    result = {}
+
+    def bind():
+        result["rollback"] = active_sessions.fence_active_session_rotation(
+            lease, session_id="race-tip"
+        )
+
+    def compete():
+        result["contender"] = active_sessions.try_acquire_active_session(
+            session_id="race-tip", surface="desktop", config={}
+        )
+
+    bind_thread = threading.Thread(target=bind)
+    bind_thread.start()
+    assert write_entered.wait(timeout=5)
+    contender_thread = threading.Thread(target=compete)
+    contender_thread.start()
+    time.sleep(0.05)
+    assert contender_thread.is_alive(), "contender must wait behind the atomic registry update"
+    allow_write.set()
+    bind_thread.join(timeout=5)
+    contender_thread.join(timeout=5)
+
+    assert result["rollback"] is not None
+    contender, message = result["contender"]
+    assert contender is None
+    assert getattr(message, "reason", None) == active_sessions.SESSION_NOT_OWNED
+    lease.release()
+
+
 def test_liveness_registry_corruption_fails_closed_without_overwrite(
     tmp_path, monkeypatch
 ):

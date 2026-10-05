@@ -325,3 +325,25 @@ class TestSessionCompressEvent:
             )
             assert compressed
 
+    def test_rotation_fence_is_reserved_before_publish_and_rolled_back_on_failure(self):
+        from hermes_state import SessionDB
+
+        calls = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.context_compressor = self._stub_compressor()
+
+            def fence(old_session_id, new_session_id):
+                calls.append(("fence", old_session_id, new_session_id))
+                return lambda: calls.append(("rollback", old_session_id, new_session_id)) or True
+
+            agent._session_lease_rotation_callback = fence
+            with patch.object(db, "publish_compression_child", side_effect=RuntimeError("publish failed")):
+                agent._compress_context(
+                    [{"role": "user", "content": "m" * 400}], "sys", approx_tokens=100
+                )
+
+        assert [call[0] for call in calls] == ["fence", "rollback"]
+        assert calls[0][1:] == calls[1][1:]
+

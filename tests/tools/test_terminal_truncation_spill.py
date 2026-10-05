@@ -66,3 +66,51 @@ class TestTruncationSpill:
             task_id="t-spill-5"))
         assert r["exit_code"] == 3
         assert Path(r["full_output_path"]).exists()
+
+    def test_request_secret_is_stream_redacted_from_return_and_spill_across_split_writes(
+        self, small_cap
+    ):
+        from gateway.request_runtime_env import bind_request_runtime_env, reset_request_runtime_env
+
+        secret = "opaque request credential value 2026"
+        command = (
+            "python3 -c \"import os,time; s=os.environ['GH_TOKEN']; "
+            "print('p'*3000); "
+            "[(os.write(1, part.encode()), time.sleep(.03)) "
+            "for part in (s[:9], s[9:21], s[21:]+'-tail\\n')]\""
+        )
+        token = bind_request_runtime_env({"GH_TOKEN": secret})
+        try:
+            result = json.loads(terminal_tool(command, task_id="t-request-spill-split"))
+        finally:
+            reset_request_runtime_env(token)
+
+        spilled = Path(result["full_output_path"]).read_text(encoding="utf-8")
+        assert secret not in result["output"]
+        assert secret not in spilled
+        assert "redacted-request-secret" in result["output"]
+        assert "redacted-request-secret" in spilled
+        assert "-tail" in result["output"] and "-tail" in spilled
+
+    def test_request_spill_redaction_does_not_bleed_after_context_reset(self, small_cap):
+        from gateway.request_runtime_env import bind_request_runtime_env, reset_request_runtime_env
+
+        secret = "reset isolated opaque value 2026"
+        token = bind_request_runtime_env({"PAPERCLIP_API_KEY": secret})
+        try:
+            protected = json.loads(terminal_tool(
+                "python3 -c \"import os; print('x'*3000); print(os.environ['PAPERCLIP_API_KEY'])\"",
+                task_id="t-request-spill-reset-protected",
+            ))
+        finally:
+            reset_request_runtime_env(token)
+
+        ordinary = json.loads(terminal_tool(
+            f"python3 -c \"print('x'*3000); print({secret!r})\"",
+            task_id="t-request-spill-reset-ordinary",
+        ))
+
+        protected_spill = Path(protected["full_output_path"]).read_text(encoding="utf-8")
+        ordinary_spill = Path(ordinary["full_output_path"]).read_text(encoding="utf-8")
+        assert secret not in protected["output"] and secret not in protected_spill
+        assert secret in ordinary["output"] and secret in ordinary_spill

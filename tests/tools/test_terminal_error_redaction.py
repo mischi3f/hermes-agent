@@ -3,6 +3,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import agent.redact as redact
 import tools.terminal_tool as terminal_tool
 
@@ -99,6 +101,30 @@ def test_successful_output_keeps_command_aware_redactor(monkeypatch):
     assert calls == [("ordinary output", "echo ok")]
 
 
+def test_request_credential_exact_value_is_redacted_from_terminal_output(monkeypatch):
+    from gateway.request_runtime_env import bind_request_runtime_env, reset_request_runtime_env
+
+    secret = "opaque terminal request credential"
+
+    class Env:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": f"terminal echoed {secret}\n", "returncode": 0}
+
+    _patch_common(monkeypatch, Env())
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    token = bind_request_runtime_env({"GH_TOKEN": secret})
+    try:
+        result = json.loads(terminal_tool.terminal_tool(command="printf output"))
+    finally:
+        reset_request_runtime_env(token)
+
+    assert result["exit_code"] == 0
+    assert secret not in result["output"]
+    assert "redacted-request-secret" in result["output"]
+
+
 def test_environment_creation_import_error_redacts_exception_text(monkeypatch):
     _patch_common(monkeypatch, None)
     monkeypatch.setattr(terminal_tool, "_active_environments", {})
@@ -135,6 +161,74 @@ def test_background_start_error_redacts_exception_text(monkeypatch):
 
     assert result["exit_code"] == -1
     assert_secret_redacted(result, "error")
+
+
+def test_request_environment_prohibits_background_and_yield_handoff(monkeypatch):
+    from gateway.request_runtime_env import bind_request_runtime_env, reset_request_runtime_env
+
+    class Env:
+        env = {}
+
+    _patch_common(monkeypatch, Env())
+    monkeypatch.setattr(
+        terminal_tool, "spawn_background_process",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+    token = bind_request_runtime_env({"PAPERCLIP_RUN_ID": "background-secret"})
+    try:
+        result = json.loads(terminal_tool.terminal_tool(command="sleep 60", background=True))
+        assert terminal_tool._yield_kwargs("sleep 60", env_type="local") == {}
+    finally:
+        reset_request_runtime_env(token)
+
+    assert result["status"] == "error"
+    assert "background" in result["error"].lower()
+
+
+@pytest.mark.parametrize("env_type", ["ssh", "docker"])
+def test_request_environment_rejects_remote_terminal_before_backend_acquisition(monkeypatch, env_type):
+    from gateway.request_runtime_env import bind_request_runtime_env, reset_request_runtime_env
+
+    plan = SimpleNamespace(env_type=env_type)
+    monkeypatch.setattr(terminal_tool, "_plan_execution", lambda *args, **kwargs: plan)
+    monkeypatch.setattr(
+        terminal_tool, "_acquire_env",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not acquire remote backend")),
+    )
+    token = bind_request_runtime_env({"GH_TOKEN": "request-secret"})
+    try:
+        result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+    finally:
+        reset_request_runtime_env(token)
+
+    assert result["status"] == "error"
+    assert "local terminal" in result["error"].lower()
+    assert "request-secret" not in str(result)
+
+
+def test_foreground_terminal_enters_request_runtime_spawn_scope(monkeypatch):
+    from gateway.request_runtime_env import (
+        bind_request_runtime_env, current_terminal_runtime_env, reset_request_runtime_env,
+    )
+
+    seen = {}
+
+    class Env:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            seen.update(current_terminal_runtime_env())
+            return {"output": "ok\n", "returncode": 0}
+
+    _patch_common(monkeypatch, Env())
+    token = bind_request_runtime_env({"PAPERCLIP_RUN_ID": "foreground-secret"})
+    try:
+        result = json.loads(terminal_tool.terminal_tool(command="echo ok"))
+    finally:
+        reset_request_runtime_env(token)
+
+    assert result["exit_code"] == 0
+    assert seen == {"PAPERCLIP_RUN_ID": "foreground-secret"}
 
 
 def test_outer_exception_redacts_error_and_traceback(monkeypatch):

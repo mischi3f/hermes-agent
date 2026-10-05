@@ -243,8 +243,17 @@ class BaseEnvironment(ABC):
         """Profile-scoped names that must not persist in the snapshot. Monotonic for the
         environment lifetime: an allowlist can be cleared after a value was captured, and
         retaining the exclusion keeps that old value from leaking to a later profile."""
+        # Request runtime names are volatile per command even outside multiplex mode. Keep the
+        # exclusion monotonic so a value captured during one request can never reappear later.
+        try:
+            from gateway.request_runtime_env import current_request_runtime_env
+            self._snapshot_passthrough_names.update(
+                name for name in current_request_runtime_env()
+                if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name))
+        except Exception:
+            logger.debug("Could not refresh request-runtime snapshot exclusions", exc_info=True)
         if not self._profile_scoped_passthrough:
-            return ()
+            return tuple(sorted(self._snapshot_passthrough_names))
         try:
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():
@@ -327,10 +336,14 @@ class BaseEnvironment(ABC):
 
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
+        from gateway.request_runtime_env import current_terminal_runtime_env
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
             snapshot_ready=self._snapshot_ready,
+            # A credential-bearing command may copy a secret into any new export, alias, or
+            # function name. Source the reusable snapshot, but never publish shell state from it.
+            persist_snapshot=not bool(current_terminal_runtime_env()),
             **self._snapshot_script_kwargs(cwd))
 
     @staticmethod
@@ -385,6 +398,7 @@ class BaseEnvironment(ABC):
                 if is_interrupted() or is_thread_interrupted(watch_interrupt_tid):
                     trace.interrupted()
                     _kill_and_join()
+                    output.finish()
                     return self._finalize_wait_result(output, output.render(suffix="\n[Command interrupted]"), 130)
                 if yield_handler is not None and consume_yield(watch_interrupt_tid):
                     drain_stop.set()
@@ -402,6 +416,7 @@ class BaseEnvironment(ABC):
                 if time.monotonic() > deadline:
                     trace.timed_out()
                     _kill_and_join()
+                    output.finish()
                     rendered = output.render(suffix=f"\n[Command timed out after {timeout}s]")
                     if output.total_chars == 0:
                         rendered = rendered.lstrip()
@@ -417,6 +432,10 @@ class BaseEnvironment(ABC):
                 _kill_and_join()
             except Exception:
                 pass  # cleanup is best-effort
+            output.close_spill()
+            raise
+        except BaseException:
+            output.close_spill()
             raise
 
         # The drain thread exits promptly after bash does (~300ms idle check);
@@ -434,6 +453,7 @@ class BaseEnvironment(ABC):
         stdin_thread = getattr(proc, "_hermes_stdin_thread", None)
         if stdin_thread is not None:
             stdin_thread.join(timeout=5)
+        output.finish()
         rendered = output.render()
         result = self._finalize_wait_result(output, rendered, proc.returncode)
         if stdin_errors := getattr(proc, "_hermes_stdin_errors", None):
@@ -509,6 +529,11 @@ class BaseEnvironment(ABC):
         See #94285.
         """
         self._before_execute()
+        try:
+            from gateway.request_runtime_env import current_terminal_runtime_env
+            terminate_descendants = bool(current_terminal_runtime_env())
+        except Exception:
+            terminate_descendants = False
 
         exec_command, sudo_stdin = self._prepare_command(command)
         # Guard against the `A && B &` subshell-wait trap by default; callers
@@ -571,6 +596,11 @@ class BaseEnvironment(ABC):
         except (KeyboardInterrupt, SystemExit):
             _on_timeout()
             raise
+        finally:
+            if terminate_descendants and proc_holder:
+                # A foreground shell can daemonize children with ``&``. Request credentials are
+                # turn-scoped, so tear down the spawned tree/group after every such command.
+                self._kill_spawned_tree(proc_holder[0])
 
         result = (
             {"output": f"[Command timed out after {effective_timeout}s]", "returncode": 124}

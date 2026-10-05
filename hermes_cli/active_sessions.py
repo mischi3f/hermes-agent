@@ -17,7 +17,7 @@ import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, named_profile_is_live
 from utils import atomic_json_write
@@ -251,12 +251,14 @@ def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
     seen_leases: set[str] = set()
     for entry in valid:
         lease_id = entry.get("lease_id")
+        session_ids = entry.get("session_ids")
         # (problem-if-True predicate, message fragment) — checked lazily, in
         # this order, so an unhashable lease id is reported before the dup check.
         for bad, what in (
             (lambda: not _nonblank_str(lease_id), "an invalid lease id"),
             (lambda: lease_id in seen_leases, "a duplicate lease id"),
             (lambda: not _nonblank_str(entry.get("session_id")), "an invalid session id"),
+            (lambda: not _valid_session_ids(session_ids, entry.get("session_id")), "invalid session aliases"),
             (lambda: _registry_pid(entry.get("pid")) <= 0, "an invalid pid"),
             (lambda: not _optional_isinstance(entry.get("surface"), str), "an invalid surface"),
             (lambda: not _optional_isinstance(entry.get("track_liveness"), bool), "an invalid liveness marker"),
@@ -271,6 +273,28 @@ def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
 
 def _nonblank_str(v: Any) -> bool:
     return isinstance(v, str) and bool(v.strip())
+
+
+def _valid_session_ids(value: Any, primary: Any) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(_nonblank_str(item) for item in value)
+        and len(set(value)) == len(value)
+        and primary in value
+    )
+
+
+def _entry_session_ids(entry: dict[str, Any]) -> tuple[str, ...]:
+    aliases = entry.get("session_ids")
+    if isinstance(aliases, list):
+        cleaned = tuple(str(item) for item in aliases if _nonblank_str(item))
+        if cleaned:
+            return cleaned
+    primary = str(entry.get("session_id") or "")
+    return (primary,) if primary else ()
 
 
 def _optional_isinstance(v: Any, typ) -> bool:
@@ -384,7 +408,7 @@ def _prune_dead(
             if (
                 not targeted
                 or (target_session_id is not None
-                    and str(entry.get("session_id") or "") == str(target_session_id))
+                    and str(target_session_id) in _entry_session_ids(entry))
                 or (target_pid is not None and entry.get("pid") == target_pid)
             ):
                 raise ActiveSessionRegistryError("active session owner liveness is unknown")
@@ -431,7 +455,7 @@ def _drop_lease(
 
 def _holds_session(entries: list[dict[str, Any]], session_id: str) -> bool:
     target = str(session_id or "")
-    return bool(target) and any(str(e.get("session_id") or "") == target for e in entries)
+    return bool(target) and any(target in _entry_session_ids(e) for e in entries)
 
 
 def _read_live_entries(
@@ -544,7 +568,7 @@ def try_acquire_active_session(
         # unsaved draft exclude every other one.
         if key:
             for index, existing in enumerate(entries):
-                if str(existing.get("session_id") or "") != key:
+                if key not in _entry_session_ids(existing):
                     continue
                 # The same writer is not a second writer: a live session that
                 # leaked its lease reference would otherwise be fenced out of
@@ -622,6 +646,7 @@ def transfer_active_session(
         own = next((e for e in entries if str(e.get("lease_id") or "") == lease.lease_id), None)
         if own is not None:
             own["session_id"] = new_session_id
+            own.pop("session_ids", None)
             own["updated_at"] = time.time()
             if metadata:
                 own["metadata"] = _clean_metadata(metadata)
@@ -635,6 +660,93 @@ def transfer_active_session(
         _write_entries(state_path, entries)
         lease.session_id = new_session_id
         return True
+
+
+def fence_active_session_rotation(
+    lease: ActiveSessionLease, *, session_id: str, metadata: Optional[dict[str, Any]] = None
+) -> Optional[Callable[[], bool]]:
+    """Atomically add a rotated id to one logical-conversation lease.
+
+    Previous ids remain aliases of the same registry entry, so stale callers are
+    fenced without consuming another capacity slot.  The returned compensation
+    removes only this id when child publication fails after the reservation.
+    """
+    new_session_id = str(session_id or "")
+    if not new_session_id or lease.released:
+        return None
+    old_session_id = lease.session_id
+    if not lease.enabled:
+        lease.session_id = new_session_id
+
+        def rollback_noop_lease() -> bool:
+            if lease.session_id != new_session_id:
+                return False
+            lease.session_id = old_session_id
+            return True
+
+        return rollback_noop_lease
+
+    state_path, lock_path = _lease_paths(lease)
+    with _FileLock(lock_path):
+        if lease.released:
+            return None
+        loaded = _read_live_entries(
+            state_path, track_liveness=lease.track_liveness,
+            warn="Active-session registry is unavailable; refusing to widen its rotation fence",
+            target_session_id=old_session_id,
+        )
+        if loaded is None:
+            return None
+        entries = loaded[1]
+        own = next((e for e in entries if str(e.get("lease_id") or "") == lease.lease_id), None)
+        if own is None:
+            return None
+        if any(
+            new_session_id in _entry_session_ids(entry)
+            and str(entry.get("lease_id") or "") != lease.lease_id
+            for entry in entries
+        ):
+            return None
+        previous_ids = list(_entry_session_ids(own))
+        if new_session_id not in previous_ids:
+            previous_ids.append(new_session_id)
+        own["session_id"] = new_session_id
+        own["session_ids"] = previous_ids
+        own["updated_at"] = time.time()
+        if metadata:
+            own["metadata"] = _clean_metadata(metadata)
+        _write_entries(state_path, entries)
+        lease.session_id = new_session_id
+
+    def rollback() -> bool:
+        with _FileLock(lock_path):
+            if lease.released:
+                return False
+            loaded = _read_live_entries(
+                state_path, track_liveness=lease.track_liveness,
+                warn="Active-session registry is unavailable; preserving its rotation fence",
+                target_session_id=new_session_id,
+            )
+            if loaded is None:
+                return False
+            entries = loaded[1]
+            own = next((e for e in entries if str(e.get("lease_id") or "") == lease.lease_id), None)
+            if own is None or str(own.get("session_id") or "") != new_session_id:
+                return False
+            aliases = [sid for sid in _entry_session_ids(own) if sid != new_session_id]
+            if not aliases:
+                return False
+            own["session_id"] = old_session_id
+            if aliases == [old_session_id]:
+                own.pop("session_ids", None)
+            else:
+                own["session_ids"] = aliases
+            own["updated_at"] = time.time()
+            _write_entries(state_path, entries)
+            lease.session_id = old_session_id
+            return True
+
+    return rollback
 
 
 # A lease this process wrote in the last few seconds may not be in the caller's
