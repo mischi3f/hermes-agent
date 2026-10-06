@@ -457,12 +457,17 @@ async def test_request_credentials_never_reach_sse_or_idempotent_event_status(tm
 def test_environment_parser_returns_an_immutable_copy():
     from gateway.request_runtime_env import parse_request_runtime_env
 
-    source = {"PAPERCLIP_RUN_ID": "run-parser-fixture", "GIT_TERMINAL_PROMPT": "0"}
+    source = {
+        "PAPERCLIP_RUN_ID": "run-parser-fixture",
+        "PAPERCLIP_PROJECT_WORKSPACE_ID": "workspace-parser-fixture",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
     parsed = parse_request_runtime_env(source)
     source["PAPERCLIP_RUN_ID"] = "changed"
 
     assert dict(parsed) == {
         "PAPERCLIP_RUN_ID": "run-parser-fixture",
+        "PAPERCLIP_PROJECT_WORKSPACE_ID": "workspace-parser-fixture",
         "GIT_TERMINAL_PROMPT": "0",
     }
     with pytest.raises(TypeError):
